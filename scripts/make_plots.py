@@ -121,22 +121,40 @@ def plot_gate_activation_by_intervention(eval_json, out_path):
 # Gate ablation failure rates
 # ---------------------------------------------------------------------------
 def plot_gate_ablation_failures(abl_json, out_path):
+    """Plot failure rate + false_struct_remap + delta_future_mse per ablation mode."""
     if abl_json is None:
         print(f"  [SKIP] gate_ablation_failures (no ablation json)"); return
-    modes  = list(abl_json.keys())
-    rates  = [1.0 - abl_json[m]["overall"].get("exact_match", 0.0) for m in modes]
+    modes = list(abl_json.keys())
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    colors = ["#3b7ec2" if "zero" in m else "#dd4b39" if m == "all_zero"
-              else "#2ca25f" if m == "oracle" else "#e6a817" for m in modes]
-    bars = ax.bar(modes, rates, color=colors)
-    ax.set_ylabel("Failure rate (1 - exact_match)")
-    ax.set_title("Gate Ablation: Failure Rate by Mode")
-    ax.set_ylim(0, 1)
-    for bar, rate in zip(bars, rates):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                f"{rate:.2f}", ha="center", va="bottom", fontsize=8)
-    plt.xticks(rotation=20, ha="right", fontsize=8)
+    failure_rates  = [1.0 - abl_json[m]["overall"].get("exact_match", 0.0) for m in modes]
+    false_struct   = [abl_json[m]["overall"].get("false_structural_remap_on_sensory", float("nan"))
+                      for m in modes]
+    df_mse         = [abl_json[m]["overall"].get("delta_future_mse", float("nan")) for m in modes]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    def _safe_nan(vals):
+        return [v if not (isinstance(v, float) and v != v) else 0.0 for v in vals]
+
+    def _bar(ax, vals, title, ylabel, ymax=None):
+        colors = ["#2ca25f" if m == "oracle" else
+                  "#dd4b39" if m == "all_zero" else
+                  "#e6a817" if m == "all_one" else "#3b7ec2" for m in modes]
+        clean = _safe_nan(vals)
+        bars = ax.bar(modes, clean, color=colors)
+        ax.set_title(title, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=8)
+        if ymax:
+            ax.set_ylim(0, ymax)
+        for bar, v in zip(bars, clean):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005 * (ymax or 1),
+                    f"{v:.3f}", ha="center", va="bottom", fontsize=6)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=7)
+
+    _bar(axes[0], failure_rates, "Failure rate (1 − exact_match)", "failure rate", ymax=1.0)
+    _bar(axes[1], false_struct,  "False struct remap (sensory-only)", "rate", ymax=1.0)
+    _bar(axes[2], df_mse,        "Δfuture MSE under ablation", "MSE")
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=120); plt.close()
     print(f"Saved {out_path}")

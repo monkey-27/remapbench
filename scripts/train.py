@@ -97,10 +97,24 @@ def _compute_loss(out, batch, cfg, device, is_gated):
             loss += sp_weight * loss_sp
             comps["loss_gate_sparsity"] = loss_sp.item()
 
-        if st_weight > 0 and "z_before" in out and "z_updated" in out:
-            loss_st = F.mse_loss(out["z_updated"], out["z_before"])
+        if st_weight > 0 and "pathway_updates" in out and "gates" in out:
+            # Stability: penalize map pathway update magnitude on sensory-only samples.
+            # sensory-only = target [1,0,0,0]: appearance change, no structural remap needed.
+            sensory_only = (
+                (targets[:, 0] > 0.5) &
+                (targets[:, 1] < 0.5) &
+                (targets[:, 2] < 0.5) &
+                (targets[:, 3] < 0.5)
+            )
+            if sensory_only.any():
+                g_map = out["gates"][:, 2].view(-1, 1, 1, 1)
+                u_map = out["pathway_updates"]["map"]
+                map_actual = g_map * u_map
+                loss_st = (map_actual[sensory_only] ** 2).mean()
+            else:
+                loss_st = torch.zeros(1, device=device).squeeze()
             loss += st_weight * loss_st
-            comps["loss_stability"] = loss_st.item()
+            comps["loss_stability_map_on_sensory"] = loss_st.item()
 
     return loss, comps
 

@@ -116,7 +116,13 @@ def _oracle_path_lens(raw, data_dir):
     return lens
 
 
-def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=False):
+def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=False,
+                   gate_override=None):
+    """Evaluate model, optionally with a gate_override for ablation studies.
+
+    When gate_override is set, out["remap_logits"] reflects the overridden gates
+    (via _safe_logit), so all reported metrics are consistent with the ablated behavior.
+    """
     model.eval()
     all_preds, all_targets, all_iids = [], [], []
     pred_df, true_df = [], []
@@ -128,9 +134,14 @@ def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=F
 
     with torch.no_grad():
         for batch in loader:
-            x = batch["x"].to(device)
+            x      = batch["x"].to(device)
             tgt_mh = batch["target_multihot"].to(device)
-            out = model(x)
+
+            if gate_override is not None:
+                out = model(x, gate_override=gate_override, target_multihot=tgt_mh)
+            else:
+                out = model(x)
+
             preds = torch.sigmoid(out["remap_logits"]).cpu().numpy()
             all_preds.append(preds)
             all_targets.append(batch["target_multihot"].numpy())
@@ -148,9 +159,9 @@ def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=F
                 gate_list.append(out["gates"].cpu().numpy())
                 iid_list_batched.append(iid_b)
 
-    preds   = np.concatenate(all_preds,   0)
-    targets = np.concatenate(all_targets, 0)
-    iids    = np.concatenate(all_iids,    0)
+    preds      = np.concatenate(all_preds,   0)
+    targets    = np.concatenate(all_targets, 0)
+    iids       = np.concatenate(all_iids,    0)
     pred_df_np = np.concatenate(pred_df, 0)
     true_df_np = np.concatenate(true_df, 0)
     pred_dv_np = np.concatenate(pred_dv, 0)
@@ -159,38 +170,35 @@ def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=F
     true_ad_np = np.concatenate(true_ad, 0)
 
     overall = compute_multilabel_metrics(preds, targets, threshold)
-    overall["delta_future_mse"]  = compute_map_mse(pred_df_np, true_df_np)
-    overall["delta_value_mse"]   = compute_map_mse(pred_dv_np, true_dv_np)
-    overall["action_delta_mse"]  = compute_map_mse(pred_ad_np, true_ad_np)
+    overall["delta_future_mse"] = compute_map_mse(pred_df_np, true_df_np)
+    overall["delta_value_mse"]  = compute_map_mse(pred_dv_np, true_dv_np)
+    overall["action_delta_mse"] = compute_map_mse(pred_ad_np, true_ad_np)
 
-    # Planning metrics using predicted value_after
+    # Planning metrics using predicted value_after (under the ablated gate if applicable)
     if compute_planning and pred_va_list and raw is not None:
-        pred_va_np = np.concatenate(pred_va_list, 0)  # [N,1,H,W]
-        grids_after  = raw["after_grid"]
-        start_xys    = raw["start_xy"]
-        goal_xys     = raw["goal_after_xy"]
+        pred_va_np   = np.concatenate(pred_va_list, 0)  # [N,1,H,W]
         oracle_lens  = _oracle_path_lens(raw, None)
         value_maps   = [pred_va_np[i, 0] for i in range(len(pred_va_np))]
         plan_metrics = compute_planning_metrics(
-            list(grids_after), list(start_xys), list(goal_xys),
+            list(raw["after_grid"]), list(raw["start_xy"]), list(raw["goal_after_xy"]),
             value_maps, oracle_lens, max_steps=50, penalty=50,
         )
         overall["planning"] = plan_metrics
 
-    # Mean gate activations per intervention type
+    # Mean gate activations per intervention type (reflects final/overridden gates)
     gate_by_itype = {}
     if gate_list:
-        all_gates = np.concatenate(gate_list, 0)
+        all_gates  = np.concatenate(gate_list, 0)
         all_iids_g = np.concatenate(iid_list_batched, 0)
         for iid_val in np.unique(all_iids_g):
-            mask = all_iids_g == iid_val
+            mask  = all_iids_g == iid_val
             iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
             gate_by_itype[iname] = all_gates[mask].mean(0).tolist()
         overall["mean_gates_per_intervention"] = gate_by_itype
 
     per_intervention = {}
     for iid_val in np.unique(iids):
-        mask = iids == iid_val
+        mask  = iids == iid_val
         iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
         per_intervention[iname] = compute_multilabel_metrics(
             preds[mask], targets[mask], threshold)
@@ -214,41 +222,27 @@ def evaluate_baseline(baseline, scalar_errors, targets, iids, threshold=0.5):
     return overall, per_intervention
 
 
-def run_gate_ablations(model, loader, device, raw, threshold=0.5):
-    """Run gate ablation modes and return results dict."""
+def run_gate_ablations(model, loader, device, raw, threshold=0.5, compute_planning=False):
+    """Run each gate ablation mode through evaluate_model for full metrics."""
     results = {}
     for mode in GATE_ABLATION_MODES:
-        model.eval()
-        all_preds, all_targets, all_iids = [], [], []
-
-        with torch.no_grad():
-            for batch in loader:
-                x       = batch["x"].to(device)
-                tgt_mh  = batch["target_multihot"].to(device)
-                kwargs  = {"gate_override": mode}
-                if mode == "oracle":
-                    kwargs["target_multihot"] = tgt_mh
-                out = model(x, **kwargs)
-                preds = torch.sigmoid(out["remap_logits"]).cpu().numpy()
-                all_preds.append(preds)
-                all_targets.append(batch["target_multihot"].numpy())
-                all_iids.append(batch["intervention_id"].numpy())
-
-        preds_all   = np.concatenate(all_preds,   0)
-        targets_all = np.concatenate(all_targets, 0)
-        iids_all    = np.concatenate(all_iids,    0)
-
-        overall = compute_multilabel_metrics(preds_all, targets_all, threshold)
-        per_intervention = {}
-        for iid_val in np.unique(iids_all):
-            mask  = iids_all == iid_val
-            iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
-            per_intervention[iname] = compute_multilabel_metrics(
-                preds_all[mask], targets_all[mask], threshold)
+        overall, per_intervention = evaluate_model(
+            model, loader, device, raw,
+            threshold=threshold,
+            compute_planning=compute_planning,
+            gate_override=mode,
+        )
         results[mode] = {"overall": overall, "per_intervention": per_intervention}
+
+        pm = overall.get("planning", {})
+        plan_str = ""
+        if pm:
+            plan_str = (f" plan_suc={pm.get('planning_success_rate', float('nan')):.3f}"
+                        f" regret={pm.get('mean_step_regret', float('nan')):.1f}")
         print(f"  ablation [{mode:15s}]: exact={overall['exact_match']:.3f} "
-              f"micro_f1={overall['micro_f1']:.3f} "
-              f"macro_f1={overall['macro_f1']:.3f}")
+              f"macro_f1={overall['macro_f1']:.3f} "
+              f"false_struct={overall['false_structural_remap_on_sensory']:.3f}"
+              f"{plan_str}")
 
     return results
 
@@ -330,7 +324,10 @@ def main():
     # Gate ablations
     if args.gate_ablations and is_gated:
         print(f"\n=== Gate ablations on {args.split} ===")
-        ablation_results = run_gate_ablations(model, loader, device, raw, args.threshold)
+        ablation_results = run_gate_ablations(
+            model, loader, device, raw, args.threshold,
+            compute_planning=is_gated,
+        )
         abl_path = os.path.join(run_dir, f"gate_ablation_eval_{args.split}.json")
         with open(abl_path, "w") as f:
             json.dump(ablation_results, f, indent=2)

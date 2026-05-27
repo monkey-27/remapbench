@@ -42,6 +42,12 @@ Evaluate with `--gate_ablations` to run 7 modes: `zero_sensory`, `zero_value`,
 `zero_map`, `zero_action`, `all_zero`, `all_one`, `oracle`. Results saved to
 `gate_ablation_eval_{split}.json`.
 
+Gate overrides affect both the latent pathway updates (via gated z_update) and the
+reported remap predictions: overridden gates are converted back to logits via
+`_safe_logit` so `remap_logits` is consistent with the ablated behavior. Oracle mode
+should achieve perfect classification. Gate ablation evaluation reports classification
+metrics, delta_future/value/action MSE, and planning behavior under each override.
+
 ### Planning Metric
 
 A greedy value-following policy uses `value_after` predictions as a navigation signal.
@@ -68,6 +74,8 @@ python scripts/evaluate.py       --config configs/smoke.yaml \
     --checkpoint results/smoke_gated_erpm/best.pt --split test_single --gate_ablations
 python scripts/evaluate.py       --config configs/smoke.yaml \
     --checkpoint results/smoke_gated_erpm/best.pt --split test_composed
+python scripts/check_gates.py    --config configs/smoke.yaml \
+    --checkpoint results/smoke_gated_erpm/best.pt --split test_single
 python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/smoke_gated_erpm
 ```
 
@@ -256,6 +264,7 @@ Checks:
   - `composed`: ≥ 2 active target labels
 - `weak_action_change` rate (warn if > 10%, hard fail if > 25%)
 - `target_multihot` shape and label sums
+- Optional robustness splits (`test_larger.npz`, `test_noisy.npz`) if present
 
 Writes `diagnostics.json`.
 
@@ -278,8 +287,12 @@ future_weight        · MSE(δfuture)
 + future_after_weight· MSE(future_after, future_after_target)
 + value_after_weight · MSE(value_after,  value_after_target)
 + gate_sparsity_weight · mean(gates)
-+ stability_weight   · MSE(z_updated, z_before)
++ stability_weight   · mean((gate_map * u_map)²)   ← sensory-only samples only
 ```
+
+The stability loss penalizes map-pathway update magnitude *only on sensory-only samples*
+(target = [1,0,0,0]) to avoid suppressing genuine structural remapping.
+Logged as `loss_stability_map_on_sensory` in `train_log.jsonl`.
 
 `train_log.jsonl` logs each loss component per epoch.
 Saves `results/{run_name}/best.pt`, `last.pt`, `train_log.jsonl`, `metrics_val.json`.

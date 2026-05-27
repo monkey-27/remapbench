@@ -77,19 +77,27 @@ def _sample_at(data, i):
 
 
 def validate(data_dir):
-    split_files = {
+    # Core splits (always expected); optional robustness splits loaded if present.
+    required_files = {
         "train_single":  "train_single.npz",
         "val_single":    "val_single.npz",
         "test_single":   "test_single.npz",
         "test_composed": "test_composed.npz",
     }
+    optional_files = {
+        "test_larger": "test_larger.npz",
+        "test_noisy":  "test_noisy.npz",
+    }
 
     splits = {}
-    for name, fname in split_files.items():
+    for name, fname in {**required_files, **optional_files}.items():
         path = os.path.join(data_dir, fname)
+        is_optional = name in optional_files
         if os.path.exists(path):
             splits[name] = load_split(path)
             print(f"Loaded {name}: {len(splits[name]['intervention_id'])} samples")
+        elif is_optional:
+            print(f"  [OPTIONAL] {path} not found — skipping")
         else:
             print(f"  [SKIP] {path} not found")
 
@@ -170,7 +178,7 @@ def validate(data_dir):
             diag["target_label_counts"][lname] = cnt
         print(f"  label counts: {diag['target_label_counts']}")
 
-        is_single = "single" in split_name
+        is_single   = "single" in split_name or split_name in ("test_larger", "test_noisy")
         is_composed = "composed" in split_name
 
         if is_single:

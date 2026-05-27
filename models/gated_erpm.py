@@ -11,12 +11,28 @@ Mechanism:
 
 The gates are simultaneously the remap_logits (trained with BCE against target_multihot),
 enforcing a tight coupling between the gating mechanism and the plasticity labels.
+
+Gate override note:
+  When gate_override is None (normal training/eval):
+    - raw_gate_logits = gate_net output
+    - gates = sigmoid(raw_gate_logits)
+    - remap_logits = raw_gate_logits   ← used for BCE training
+  When gate_override is set (ablation):
+    - final_gates reflect the override
+    - remap_logits = _safe_logit(final_gates)   ← ablated predictions
+    - raw_gate_logits still returned for reference
 """
 import torch
 import torch.nn as nn
 
 N_GRID = 10
 LATENT = 64
+
+
+def _safe_logit(p, eps=1e-6):
+    """Numerically safe logit: clamps p away from 0/1 before log-odds."""
+    p = p.clamp(eps, 1 - eps)
+    return torch.log(p / (1 - p))
 
 
 class _ResBlock(nn.Module):
@@ -71,8 +87,13 @@ class GatedERPM(nn.Module):
 
     Returns a dict with keys:
         future_after, value_after, delta_future, delta_value, action_delta,
-        remap_logits, gates, gate_logits, z_before, z_after, z_updated,
-        pathway_updates (dict: sensory/value/map/action each [B,64,H,W])
+        remap_logits   — logits for remap prediction (raw during training, safe_logit(final) during ablation)
+        raw_gate_logits — original gate_net output (always)
+        raw_gates       — sigmoid(raw_gate_logits)
+        gates           — final gates after any override (equals raw_gates when no override)
+        gate_logits     — _safe_logit(gates)  (equals raw_gate_logits when no override)
+        z_before, z_after, z_updated,
+        pathway_updates (dict: sensory/value/map/action each [B,L,H,W])
     """
 
     def __init__(self, n_grid=N_GRID, latent=LATENT):
@@ -115,34 +136,42 @@ class GatedERPM(nn.Module):
         error_features = self.error_net(err_in)   # [B, L, H, W]
 
         pooled = error_features.mean(dim=(2, 3))  # [B, L]
-        gate_logits = self.gate_net(pooled)        # [B, 4]
-        gates = torch.sigmoid(gate_logits)
+        raw_gate_logits = self.gate_net(pooled)   # [B, 4]
+        raw_gates = torch.sigmoid(raw_gate_logits)
 
         if gate_override is not None:
-            gates = self._apply_override(gates, gate_override, target_multihot)
+            final_gates = self._apply_override(raw_gates, gate_override, target_multihot)
+            final_gate_logits = _safe_logit(final_gates)
+            remap_logits = final_gate_logits
+        else:
+            final_gates = raw_gates
+            final_gate_logits = raw_gate_logits
+            remap_logits = raw_gate_logits
 
         u_sensory = self.sensory_head(error_features)
         u_value   = self.value_head(error_features)
         u_map     = self.map_head(error_features)
         u_action  = self.action_head(error_features)
 
-        g = gates.view(B, 4, 1, 1)
+        g = final_gates.view(B, 4, 1, 1)
         z_update  = (g[:, 0:1] * u_sensory + g[:, 1:2] * u_value
                      + g[:, 2:3] * u_map + g[:, 3:4] * u_action)
         z_updated = z_before + z_update
 
         return {
-            "future_after":  self.future_after_head(z_updated),
-            "value_after":   self.value_after_head(z_updated),
-            "delta_future":  self.delta_future_head(z_updated),
-            "delta_value":   self.delta_value_head(z_updated),
-            "action_delta":  self.action_delta_head(z_updated),
-            "remap_logits":  gate_logits,   # gates ARE the remap classification
-            "gates":         gates,
-            "gate_logits":   gate_logits,
-            "z_before":      z_before,
-            "z_after":       z_after,
-            "z_updated":     z_updated,
+            "future_after":     self.future_after_head(z_updated),
+            "value_after":      self.value_after_head(z_updated),
+            "delta_future":     self.delta_future_head(z_updated),
+            "delta_value":      self.delta_value_head(z_updated),
+            "action_delta":     self.action_delta_head(z_updated),
+            "remap_logits":     remap_logits,
+            "raw_gate_logits":  raw_gate_logits,
+            "raw_gates":        raw_gates,
+            "gates":            final_gates,
+            "gate_logits":      final_gate_logits,
+            "z_before":         z_before,
+            "z_after":          z_after,
+            "z_updated":        z_updated,
             "pathway_updates": {
                 "sensory": u_sensory,
                 "value":   u_value,
@@ -151,8 +180,8 @@ class GatedERPM(nn.Module):
             },
         }
 
-    def _apply_override(self, gates, mode, target_multihot):
-        g = gates.clone()
+    def _apply_override(self, raw_gates, mode, target_multihot):
+        g = raw_gates.clone()
         if mode == "zero_sensory":  g[:, 0] = 0.0
         elif mode == "zero_value":  g[:, 1] = 0.0
         elif mode == "zero_map":    g[:, 2] = 0.0
@@ -161,5 +190,5 @@ class GatedERPM(nn.Module):
         elif mode == "all_one":     g = torch.ones_like(g)
         elif mode == "oracle":
             if target_multihot is not None:
-                g = target_multihot.float().to(gates.device)
+                g = target_multihot.float().to(raw_gates.device)
         return g
