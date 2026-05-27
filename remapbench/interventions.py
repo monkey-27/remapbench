@@ -200,15 +200,37 @@ def apply_topology_change(grid, start, goal, rng):
 
 
 # ---------------------------------------------------------------------------
-# 4. Action change (strengthened: path-relevant)
+# 4. Action change (strengthened: path-relevant, path-action aware)
 # ---------------------------------------------------------------------------
+
+def _orig_path_action(path, r, c):
+    """
+    Return the action index taken at (r,c) along path toward the next cell,
+    or -1 if (r,c) is not an interior path cell.
+    """
+    for idx, p in enumerate(path):
+        if p == (r, c) and idx + 1 < len(path):
+            nr, nc = path[idx + 1]
+            dr, dc = nr - r, nc - c
+            for a in range(4):
+                if ACT_DR[a] == dr and ACT_DC[a] == dc:
+                    return a
+    return -1
+
 
 def apply_action_change(grid, start, goal, rng):
     """
     Add one-way behavior on a path-relevant free cell.
-    Prefers cells on the shortest path; falls back to cells within Manhattan
-    distance 2 of the path, then all reachable cells (marked as weak).
-    Returns weak_action_change=1 if path-length relevance could not be confirmed.
+
+    Strong (weak=0) conditions:
+      - Cell on shortest path AND directed path length changes ≥ 1, OR
+      - Cell on shortest path AND the one-way direction differs from the
+        original path action at that cell (forcing a detour), OR
+      - Cell near path AND directed path length changes ≥ 1.
+
+    Weak (weak=1) fallback:
+      - Near-path cell with no path-length change, OR
+      - Any free cell (last resort).
     """
     H, W = grid.shape[1], grid.shape[2]
     path = _shortest_path_cells(grid, start, goal)
@@ -218,31 +240,22 @@ def apply_action_change(grid, start, goal, rng):
     reachable = bfs_reachable_undirected(grid, start)
     T_before = build_transition(grid)
 
-    # Build candidate tiers: (cells_on_path, near_path, all_free)
     near_path = {
         (r + dr, c + dc)
         for (r, c) in path_set
         for dr in range(-2, 3) for dc in range(-2, 3)
         if 0 <= r + dr < H and 0 <= c + dc < W
     }
-    on_path = [
-        p for p in reachable
-        if p in path_set and p not in (start, goal) and not grid[CH_WALL, p[0], p[1]]
-    ]
-    near_only = [
-        p for p in reachable
-        if p in near_path and p not in path_set and p not in (start, goal)
-        and not grid[CH_WALL, p[0], p[1]]
-    ]
-    all_free = [
-        p for p in reachable
-        if p not in path_set and p not in near_path and p not in (start, goal)
-        and not grid[CH_WALL, p[0], p[1]]
-    ]
+    on_path  = [p for p in reachable
+                if p in path_set and p not in (start, goal) and not grid[CH_WALL, p[0], p[1]]]
+    near_only = [p for p in reachable
+                 if p in near_path and p not in path_set and p not in (start, goal)
+                 and not grid[CH_WALL, p[0], p[1]]]
+    all_free  = [p for p in reachable
+                 if p not in near_path and p not in (start, goal)
+                 and not grid[CH_WALL, p[0], p[1]]]
 
-    rng.shuffle(on_path)
-    rng.shuffle(near_only)
-    rng.shuffle(all_free)
+    rng.shuffle(on_path); rng.shuffle(near_only); rng.shuffle(all_free)
 
     def _try_cell(r, c):
         if any(grid[ch, r, c] for ch in ONE_WAY_CHANNELS):
@@ -260,41 +273,52 @@ def apply_action_change(grid, start, goal, rng):
                 continue
             if not (T_before != T2).any():
                 continue
-            return g2, T2, pl
+            return g2, T2, pl, d
         return None
 
-    # Tier 1: on path — only accept if path_len changes OR cell is on path
+    # Tier 1: on path — strong if path_len changes OR path action changes
     for (r, c) in on_path:
-        result = _try_cell(r, c)
-        if result is None:
+        res = _try_cell(r, c)
+        if res is None:
             continue
-        g2, T2, pl_after = result
-        # On path is always relevant (strong)
-        return g2, goal, "action_change", MULTIHOT_ACTION, 0
+        g2, T2, pl_after, d = res
+        path_len_changed   = abs(pl_after - path_before) >= 1
+        orig_act = _orig_path_action(path, r, c)
+        path_act_changed   = (orig_act >= 0 and d != orig_act)
+        if path_len_changed or path_act_changed:
+            return g2, goal, "action_change", MULTIHOT_ACTION, 0  # strong
 
-    # Tier 2: near path — require path_len change
+    # Tier 2: near path — strong only if path_len changes
     for (r, c) in near_only:
-        result = _try_cell(r, c)
-        if result is None:
+        res = _try_cell(r, c)
+        if res is None:
             continue
-        g2, T2, pl_after = result
+        g2, T2, pl_after, d = res
         if abs(pl_after - path_before) >= 1:
-            return g2, goal, "action_change", MULTIHOT_ACTION, 0
+            return g2, goal, "action_change", MULTIHOT_ACTION, 0  # strong
 
-    # Tier 3: near path — no path_len requirement (near-path is still behaviorally close)
+    # Tier 3: on path — weak (path action didn't change in a behaviorally strong way)
+    for (r, c) in on_path:
+        res = _try_cell(r, c)
+        if res is None:
+            continue
+        g2, T2, pl_after, d = res
+        return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak: on path but no strong criterion
+
+    # Tier 4: near path — weak (no path-length change)
     for (r, c) in near_only:
-        result = _try_cell(r, c)
-        if result is None:
+        res = _try_cell(r, c)
+        if res is None:
             continue
-        g2, T2, pl_after = result
-        return g2, goal, "action_change", MULTIHOT_ACTION, 0
+        g2, T2, pl_after, d = res
+        return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak
 
-    # Tier 4: fallback — any reachable cell, marked as weak
+    # Tier 5: any free cell — weak fallback
     for (r, c) in all_free:
-        result = _try_cell(r, c)
-        if result is None:
+        res = _try_cell(r, c)
+        if res is None:
             continue
-        g2, T2, pl_after = result
+        g2, T2, pl_after, d = res
         return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak
 
     raise ValueError("action_change: could not find valid one-way placement")

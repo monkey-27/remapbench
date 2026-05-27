@@ -12,19 +12,42 @@ perceptual noise (lighting, texture). This pilot implements **Error-Gated Plasti
 (ERPM)**: a mechanism that routes different error signals — sensory, value, future-state,
 and action prediction errors — to distinct update pathways, enabling *selective* remapping.
 
-### Mechanism
+### GatedERPM Mechanism
 
-An ERPM agent maintains four internal pathways:
+`GatedERPM` implements explicit latent pathway routing via learned error gates:
+
+1. **Encode** before/after grids into shared spatial latent states `z_before`, `z_after`.
+2. **Error features** from `[z_b, z_a, z_a−z_b, |z_a−z_b|]` via a convolutional net.
+3. **Gates** from global-average-pooled error features → MLP → `sigmoid` → `[B,4]`.
+   The gates are simultaneously the `remap_logits` (trained via BCE against `target_multihot`).
+4. **Pathway heads**: four independent convolutional heads compute pathway-specific
+   latent updates from the error features.
+5. **Gated update**: `z_update = Σ_k gate_k · u_k`, then `z_updated = z_before + z_update`.
+6. **Decoders**: `future_after`, `value_after`, `delta_future`, `delta_value`, `action_delta`
+   decoded from `z_updated`.
+
+The coupling between gating and label prediction enforces mechanistic alignment:
+if gate_k fires, the k-th pathway is active, and the BCE loss forces gate_k ≈ target_k.
 
 | Pathway | Updates when | Oracle label |
 |---------|-------------|--------------|
 | Sensory | Appearance/nuisance changes (no structural shift) | `sensory_update` |
 | Value | Goal/reward location changes | `value_remap` |
-| Predictive map | Topology / future-state structure changes | `map_remap` |
+| Map | Topology / future-state structure changes | `map_remap` |
 | Action | One-way / affordance constraints change | `action_remap` |
 
-Each before→after gridworld pair is labelled with a multi-hot target
-indicating which pathways should update.
+### Gate Ablation
+
+Evaluate with `--gate_ablations` to run 7 modes: `zero_sensory`, `zero_value`,
+`zero_map`, `zero_action`, `all_zero`, `all_one`, `oracle`. Results saved to
+`gate_ablation_eval_{split}.json`.
+
+### Planning Metric
+
+A greedy value-following policy uses `value_after` predictions as a navigation signal.
+At each step the agent moves to the highest-predicted-value non-visited neighbor.
+Planning metrics: `planning_success_rate`, `mean_step_regret` vs oracle directed path,
+`failure_rate`. Available when `model=gated_erpm`.
 
 ---
 
@@ -40,12 +63,12 @@ pip install -r requirements.txt
 python scripts/generate_data.py  --config configs/smoke.yaml
 python -m remapbench.validate    --data_dir data/smoke
 python -m remapbench.visualize   --data_dir data/smoke --out_dir figures/smoke --n 4
-python scripts/train.py          --config configs/smoke.yaml --model erpm --seed 0
+python scripts/train.py          --config configs/smoke.yaml
 python scripts/evaluate.py       --config configs/smoke.yaml \
-    --checkpoint results/smoke_erpm/best.pt --split test_single
+    --checkpoint results/smoke_gated_erpm/best.pt --split test_single --gate_ablations
 python scripts/evaluate.py       --config configs/smoke.yaml \
-    --checkpoint results/smoke_erpm/best.pt --split test_composed
-python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/smoke_erpm
+    --checkpoint results/smoke_gated_erpm/best.pt --split test_composed
+python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/smoke_gated_erpm
 ```
 
 ### Pilot commands *(longer run; do not run by default)*
@@ -53,12 +76,12 @@ python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/s
 ```bash
 python scripts/generate_data.py  --config configs/pilot.yaml
 python -m remapbench.validate    --data_dir data/remapbench_v0
-python scripts/train.py          --config configs/pilot.yaml --model erpm --seed 0
+python scripts/train.py          --config configs/pilot.yaml
 python scripts/evaluate.py       --config configs/pilot.yaml \
-    --checkpoint results/pilot_erpm_seed0/best.pt --split test_single
+    --checkpoint results/pilot_gated_erpm_seed0/best.pt --split test_single --gate_ablations
 python scripts/evaluate.py       --config configs/pilot.yaml \
-    --checkpoint results/pilot_erpm_seed0/best.pt --split test_composed
-python scripts/make_plots.py     --config configs/pilot.yaml --run_dir results/pilot_erpm_seed0
+    --checkpoint results/pilot_gated_erpm_seed0/best.pt --split test_composed
+python scripts/make_plots.py     --config configs/pilot.yaml --run_dir results/pilot_gated_erpm_seed0
 ```
 
 ---
@@ -70,21 +93,23 @@ remapbench/
     env.py           – grid constants, random generation, transition model
     oracle.py        – future occupancy, value map, action delta, error metrics
     interventions.py – five intervention generators
-    generate.py      – dataset assembly CLI
+    generate.py      – dataset assembly CLI (supports test_larger, test_noisy)
     validate.py      – assertion-based validation + diagnostics.json
     visualize.py     – matplotlib sample figures
     data.py          – PyTorch Dataset wrapper
+    planning.py      – greedy value-following policy + planning regret metrics
 models/
     erpm.py          – ErrorGatedPredictiveMapCNN, StandardPredictiveMapCNN
+    gated_erpm.py    – GatedERPM: explicit latent gating mechanism
     baselines.py     – heuristic baselines
 scripts/
     generate_data.py – config-driven data generation
-    train.py         – training loop
-    evaluate.py      – evaluation + baseline comparison
-    make_plots.py    – paper-style figures
+    train.py         – training loop (supports gated losses)
+    evaluate.py      – evaluation + baseline comparison + gate ablations + planning
+    make_plots.py    – paper-style figures (gate heatmap, ablation, planning regret)
 configs/
-    smoke.yaml       – smoke test config (200 train, 2 epochs)
-    pilot.yaml       – full pilot config (12k train, 30 epochs)
+    smoke.yaml       – smoke test config (200 train, 2 epochs, gated_erpm)
+    pilot.yaml       – full pilot config (12k train, 30 epochs, gated_erpm)
 ```
 
 ---
@@ -202,6 +227,11 @@ Reverse BFS from goal under directed transitions.
 | `val_single` | 2 000 | balanced single | 500 000 |
 | `test_single` | 2 000 | balanced single | 1 000 000 |
 | `test_composed` | 2 000 | balanced composed | 1 500 000 |
+| `test_larger` | 0 (1 000 in pilot) | balanced single, 12×12 | 2 000 000 |
+| `test_noisy` | 0 (1 000 in pilot) | balanced single, noisy | 2 500 000 |
+
+`test_larger`: 12×12 grid (vs default 10×10), tests generalisation to unseen grid size.
+`test_noisy`: higher nuisance density (`nuisance_prob=0.35`, `distractor_prob=0.25`).
 
 Each sample uses a unique layout seed derived from its global index.
 Disjoint seed offset ranges guarantee **no layout leakage across splits**.
@@ -224,7 +254,7 @@ Checks:
   - `topology_change`: high `future_error`
   - `action_change`: high `action_error`
   - `composed`: ≥ 2 active target labels
-- `weak_action_change` rate (warn if > 20%)
+- `weak_action_change` rate (warn if > 10%, hard fail if > 25%)
 - `target_multihot` shape and label sums
 
 Writes `diagnostics.json`.
@@ -234,17 +264,24 @@ Writes `diagnostics.json`.
 ## Training
 
 ```bash
-python scripts/train.py --config configs/smoke.yaml --model erpm --seed 0
+python scripts/train.py --config configs/smoke.yaml
 ```
 
-**Loss**:
+`--model` defaults to `cfg["model"]` (i.e., `gated_erpm` in the provided configs).
+
+**Loss (GatedERPM)**:
 ```
-future_weight · MSE(δfuture)
-+ value_weight · MSE(δvalue)
-+ action_weight · MSE(action_delta)
-+ type_weight · BCEWithLogitsLoss(remap_logits, target_multihot)
+future_weight        · MSE(δfuture)
++ value_weight       · MSE(δvalue)
++ action_weight      · MSE(action_delta)
++ type_weight        · BCE(remap_logits, target_multihot)
++ future_after_weight· MSE(future_after, future_after_target)
++ value_after_weight · MSE(value_after,  value_after_target)
++ gate_sparsity_weight · mean(gates)
++ stability_weight   · MSE(z_updated, z_before)
 ```
 
+`train_log.jsonl` logs each loss component per epoch.
 Saves `results/{run_name}/best.pt`, `last.pt`, `train_log.jsonl`, `metrics_val.json`.
 
 ---
@@ -253,15 +290,20 @@ Saves `results/{run_name}/best.pt`, `last.pt`, `train_log.jsonl`, `metrics_val.j
 
 ```bash
 python scripts/evaluate.py --config configs/smoke.yaml \
-    --checkpoint results/smoke_erpm/best.pt --split test_single
+    --checkpoint results/smoke_gated_erpm/best.pt --split test_single --gate_ablations
 ```
 
 Reports:
 - Exact match, micro/macro F1, per-label precision/recall/F1
 - False structural remap rate (sensory-only samples predicted with structural labels)
 - Missed remap rates per structural label
-- Δfuture / Δvalue MSE
+- Δfuture / Δvalue / action_delta MSE
+- Planning metrics (`planning_success_rate`, `mean_step_regret`, `failure_rate`)
+- Mean gate activations per intervention type
 - Per-intervention breakdown
+
+`--gate_ablations` additionally runs 7 ablation modes and saves
+`gate_ablation_eval_{split}.json`.
 
 Also evaluates **heuristic baselines**:
 - `sensory_gated`: nuisance_error > threshold → sensory_update
@@ -276,15 +318,19 @@ Also evaluates **heuristic baselines**:
 ## Plotting
 
 ```bash
-python scripts/make_plots.py --config configs/smoke.yaml --run_dir results/smoke_erpm
+python scripts/make_plots.py --config configs/smoke.yaml --run_dir results/smoke_gated_erpm
 ```
 
 Generates in `results/{run_name}/figures/`:
-1. `error_dissociation_scatter.png` — nuisance vs future error, coloured by type
-2. `baseline_false_structural_remap.png` — false structural remap rates
-3. `missed_remap_rates.png` — missed remap by model/baseline
-4. `remap_confusion_or_multilabel_heatmap.png` — per-label F1 heatmap
-5. `sample_predictions.png` — before/after + true/predicted maps + labels
+1. `error_dissociation_full_visual.png` — full_visual_error vs future_error by type
+2. `error_dissociation_nuisance.png` — nuisance_error vs future_error by type
+3. `gate_activation_by_intervention.png` — mean gate values heatmap per intervention
+4. `gate_ablation_failures.png` — failure rate per ablation mode
+5. `planning_regret.png` — mean step regret vs oracle
+6. `baseline_false_structural_remap.png` — false structural remap rates
+7. `missed_remap_rates.png` — missed remap by model/baseline
+8. `remap_confusion_or_multilabel_heatmap.png` — per-label F1 heatmap
+9. `sample_gate_predictions.png` — before/after grid + gate predictions
 
 ---
 
@@ -298,14 +344,17 @@ Generates in `results/{run_name}/figures/`:
    pixel observations. Extending to pixel rendering would stress-test sensory
    generalisation more realistically.
 
-3. **Architecture-equivalent baselines**: `StandardPredictiveMapCNN` currently
-   uses the same architecture as ERPM. Future work should strengthen the baseline
-   (e.g., using a single scalar error head, or training without the type loss) to
-   better ablate the error-gating mechanism.
+3. **Architecture-equivalent baselines**: `StandardPredictiveMapCNN` and legacy `erpm`
+   use the same architecture. `GatedERPM` introduces a genuine gating mechanism.
+   Use `model: gated_erpm` for mechanistic experiments.
 
 4. **Shallow training**: 2-epoch smoke training does not converge; it is a
    pipeline check only. Run `configs/pilot.yaml` (30 epochs) for meaningful results.
 
 5. **`action_change` behavioural relevance**: a `weak_action_change=1` flag marks
    fallback samples where path-relevance could not be confirmed. Monitor the weak
-   rate (should be < 20%) in diagnostics.json.
+   rate (warn >10%, hard fail >25%) in diagnostics.json.
+
+6. **Planning metric requires converged model**: the greedy value-following policy
+   relies on `value_after` predictions. With untrained or 2-epoch smoke models the
+   metric will reflect random walking, not learned planning.

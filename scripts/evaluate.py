@@ -1,10 +1,10 @@
 """
-Evaluation script for trained model and heuristic baselines.
+Evaluation script for trained model, heuristic baselines, gate ablations, and planning metrics.
 Usage:
     python scripts/evaluate.py --config configs/smoke.yaml \
-        --checkpoint results/smoke_erpm/best.pt --split test_single
+        --checkpoint results/smoke_gated_erpm/best.pt --split test_single
     python scripts/evaluate.py --config configs/smoke.yaml \
-        --checkpoint results/smoke_erpm/best.pt --split test_composed
+        --checkpoint results/smoke_gated_erpm/best.pt --split test_single --gate_ablations
 """
 import argparse
 import json
@@ -19,18 +19,21 @@ import torch
 from torch.utils.data import DataLoader
 
 from remapbench.data import RemapDataset
-from models.erpm import build_model
-from models.baselines import (
-    SensoryGatedBaseline, ValueGatedBaseline, MapGatedBaseline,
-    ActionGatedBaseline, GlobalPlasticityBaseline, OracleBaseline,
-    ALL_BASELINES,
-)
+from remapbench.planning import compute_planning_metrics
+from remapbench.env import directed_path_len, build_transition
+from models import build_model
+from models.baselines import OracleBaseline, ALL_BASELINES
 
 TARGET_NAMES = ["sensory_update", "value_remap", "map_remap", "action_remap"]
 INTERVENTION_NAMES = {
     0: "sensory_nuisance", 1: "goal_relocation",
     2: "topology_change",  3: "action_change",  4: "composed",
 }
+
+GATE_ABLATION_MODES = [
+    "zero_sensory", "zero_value", "zero_map", "zero_action",
+    "all_zero", "all_one", "oracle",
+]
 
 
 def get_device(cfg_device):
@@ -39,10 +42,9 @@ def get_device(cfg_device):
     return torch.device(cfg_device)
 
 
-def compute_multilabel_metrics(preds, targets):
-    """All arrays are float32 numpy [N,4]. Threshold preds at 0.5."""
-    preds_b   = (preds   > 0.5).astype(bool)
-    targets_b = (targets > 0.5).astype(bool)
+def compute_multilabel_metrics(preds, targets, threshold=0.5):
+    preds_b   = (preds   > threshold).astype(bool)
+    targets_b = (targets > threshold).astype(bool)
     eps = 1e-8
     N = len(preds)
 
@@ -66,15 +68,12 @@ def compute_multilabel_metrics(preds, targets):
     micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r + eps)
     macro_f1 = float(np.mean([per_label[l]["f1"] for l in TARGET_NAMES]))
 
-    # False structural remap on sensory-only samples:
-    #   true = [1,0,0,0] (sensory_update only), pred includes any of value/map/action
     sensory_only = (targets_b[:, 0] & ~targets_b[:, 1] & ~targets_b[:, 2] & ~targets_b[:, 3])
     if sensory_only.sum() > 0:
-        false_struct = (preds_b[sensory_only, 1:].any(1)).mean()
+        false_struct = float((preds_b[sensory_only, 1:].any(1)).mean())
     else:
         false_struct = float("nan")
 
-    # Missed remap rate: for each structural label (v/m/a), rate of false negatives
     missed = {}
     for i, lname in enumerate(TARGET_NAMES[1:], 1):
         pos = targets_b[:, i]
@@ -98,120 +97,251 @@ def compute_map_mse(pred_maps, true_maps):
     return float(np.mean((pred_maps - true_maps) ** 2))
 
 
-def evaluate_model(model, loader, device):
+def _oracle_path_lens(raw, data_dir):
+    """Compute oracle directed path lengths for each sample."""
+    from remapbench.env import build_transition, directed_path_len
+    grids_after = raw["after_grid"]
+    start_xys   = raw["start_xy"]
+    goal_xys    = raw["goal_after_xy"]
+    W = grids_after.shape[-1]
+    lens = []
+    for i in range(len(grids_after)):
+        T = build_transition(grids_after[i])
+        sxy = start_xys[i]
+        gxy = goal_xys[i]
+        start = (int(sxy[1]), int(sxy[0]))
+        goal  = (int(gxy[1]), int(gxy[0]))
+        pl = directed_path_len(T, start, goal, W)
+        lens.append(pl)
+    return lens
+
+
+def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=False):
     model.eval()
     all_preds, all_targets, all_iids = [], [], []
     pred_df, true_df = [], []
     pred_dv, true_dv = [], []
+    pred_ad, true_ad = [], []
+    pred_va_list = []
+    gate_list = []
+    iid_list_batched = []
 
     with torch.no_grad():
         for batch in loader:
             x = batch["x"].to(device)
+            tgt_mh = batch["target_multihot"].to(device)
             out = model(x)
             preds = torch.sigmoid(out["remap_logits"]).cpu().numpy()
             all_preds.append(preds)
             all_targets.append(batch["target_multihot"].numpy())
-            all_iids.append(batch["intervention_id"].numpy())
+            iid_b = batch["intervention_id"].numpy()
+            all_iids.append(iid_b)
             pred_df.append(out["delta_future"].cpu().numpy())
             true_df.append(batch["delta_future"].numpy())
             pred_dv.append(out["delta_value"].cpu().numpy())
             true_dv.append(batch["delta_value"].numpy())
+            pred_ad.append(out["action_delta"].cpu().numpy())
+            true_ad.append(batch["action_delta"].numpy())
+            if "value_after" in out:
+                pred_va_list.append(out["value_after"].cpu().numpy())
+            if "gates" in out:
+                gate_list.append(out["gates"].cpu().numpy())
+                iid_list_batched.append(iid_b)
 
     preds   = np.concatenate(all_preds,   0)
     targets = np.concatenate(all_targets, 0)
     iids    = np.concatenate(all_iids,    0)
-    pred_df = np.concatenate(pred_df, 0)
-    true_df = np.concatenate(true_df, 0)
-    pred_dv = np.concatenate(pred_dv, 0)
-    true_dv = np.concatenate(true_dv, 0)
+    pred_df_np = np.concatenate(pred_df, 0)
+    true_df_np = np.concatenate(true_df, 0)
+    pred_dv_np = np.concatenate(pred_dv, 0)
+    true_dv_np = np.concatenate(true_dv, 0)
+    pred_ad_np = np.concatenate(pred_ad, 0)
+    true_ad_np = np.concatenate(true_ad, 0)
 
-    overall = compute_multilabel_metrics(preds, targets)
-    overall["delta_future_mse"] = compute_map_mse(pred_df, true_df)
-    overall["delta_value_mse"]  = compute_map_mse(pred_dv, true_dv)
+    overall = compute_multilabel_metrics(preds, targets, threshold)
+    overall["delta_future_mse"]  = compute_map_mse(pred_df_np, true_df_np)
+    overall["delta_value_mse"]   = compute_map_mse(pred_dv_np, true_dv_np)
+    overall["action_delta_mse"]  = compute_map_mse(pred_ad_np, true_ad_np)
 
-    # Per-intervention breakdown
+    # Planning metrics using predicted value_after
+    if compute_planning and pred_va_list and raw is not None:
+        pred_va_np = np.concatenate(pred_va_list, 0)  # [N,1,H,W]
+        grids_after  = raw["after_grid"]
+        start_xys    = raw["start_xy"]
+        goal_xys     = raw["goal_after_xy"]
+        oracle_lens  = _oracle_path_lens(raw, None)
+        value_maps   = [pred_va_np[i, 0] for i in range(len(pred_va_np))]
+        plan_metrics = compute_planning_metrics(
+            list(grids_after), list(start_xys), list(goal_xys),
+            value_maps, oracle_lens, max_steps=50, penalty=50,
+        )
+        overall["planning"] = plan_metrics
+
+    # Mean gate activations per intervention type
+    gate_by_itype = {}
+    if gate_list:
+        all_gates = np.concatenate(gate_list, 0)
+        all_iids_g = np.concatenate(iid_list_batched, 0)
+        for iid_val in np.unique(all_iids_g):
+            mask = all_iids_g == iid_val
+            iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
+            gate_by_itype[iname] = all_gates[mask].mean(0).tolist()
+        overall["mean_gates_per_intervention"] = gate_by_itype
+
     per_intervention = {}
     for iid_val in np.unique(iids):
         mask = iids == iid_val
         iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
-        per_intervention[iname] = compute_multilabel_metrics(preds[mask], targets[mask])
+        per_intervention[iname] = compute_multilabel_metrics(
+            preds[mask], targets[mask], threshold)
 
     return overall, per_intervention
 
 
-def evaluate_baseline(baseline, scalar_errors, targets, iids):
+def evaluate_baseline(baseline, scalar_errors, targets, iids, threshold=0.5):
     if isinstance(baseline, OracleBaseline):
         preds = baseline.predict(scalar_errors, targets=targets)
     else:
         preds = baseline.predict(scalar_errors)
 
-    overall = compute_multilabel_metrics(preds, targets)
+    overall = compute_multilabel_metrics(preds, targets, threshold)
     per_intervention = {}
     for iid_val in np.unique(iids):
         mask = iids == iid_val
         iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
-        per_intervention[iname] = compute_multilabel_metrics(preds[mask], targets[mask])
+        per_intervention[iname] = compute_multilabel_metrics(
+            preds[mask], targets[mask], threshold)
     return overall, per_intervention
+
+
+def run_gate_ablations(model, loader, device, raw, threshold=0.5):
+    """Run gate ablation modes and return results dict."""
+    results = {}
+    for mode in GATE_ABLATION_MODES:
+        model.eval()
+        all_preds, all_targets, all_iids = [], [], []
+
+        with torch.no_grad():
+            for batch in loader:
+                x       = batch["x"].to(device)
+                tgt_mh  = batch["target_multihot"].to(device)
+                kwargs  = {"gate_override": mode}
+                if mode == "oracle":
+                    kwargs["target_multihot"] = tgt_mh
+                out = model(x, **kwargs)
+                preds = torch.sigmoid(out["remap_logits"]).cpu().numpy()
+                all_preds.append(preds)
+                all_targets.append(batch["target_multihot"].numpy())
+                all_iids.append(batch["intervention_id"].numpy())
+
+        preds_all   = np.concatenate(all_preds,   0)
+        targets_all = np.concatenate(all_targets, 0)
+        iids_all    = np.concatenate(all_iids,    0)
+
+        overall = compute_multilabel_metrics(preds_all, targets_all, threshold)
+        per_intervention = {}
+        for iid_val in np.unique(iids_all):
+            mask  = iids_all == iid_val
+            iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
+            per_intervention[iname] = compute_multilabel_metrics(
+                preds_all[mask], targets_all[mask], threshold)
+        results[mode] = {"overall": overall, "per_intervention": per_intervention}
+        print(f"  ablation [{mode:15s}]: exact={overall['exact_match']:.3f} "
+              f"micro_f1={overall['micro_f1']:.3f} "
+              f"macro_f1={overall['macro_f1']:.3f}")
+
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",     required=True)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--split",      default="test_single",
-                        choices=["test_single", "test_composed", "val_single"])
-    parser.add_argument("--model",      default="erpm")
+    parser.add_argument("--config",        required=True)
+    parser.add_argument("--checkpoint",    required=True)
+    parser.add_argument("--split",         default="test_single",
+                        choices=["test_single", "test_composed", "val_single",
+                                 "test_larger", "test_noisy"])
+    parser.add_argument("--model",         default=None)
+    parser.add_argument("--threshold",     type=float, default=0.5)
+    parser.add_argument("--gate_ablations", action="store_true",
+                        help="Run gate ablation study (gated_erpm only)")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = get_device(cfg.get("device", "auto"))
+    model_name = args.model or cfg.get("model", "erpm")
+    is_gated   = (model_name == "gated_erpm")
+
+    device  = get_device(cfg.get("device", "auto"))
     run_dir = os.path.join("results", cfg["run_name"])
     os.makedirs(run_dir, exist_ok=True)
 
-    # Load data
     split_path = os.path.join(cfg["data_dir"], f"{args.split}.npz")
-    ds     = RemapDataset(split_path)
-    loader = DataLoader(ds, batch_size=cfg.get("batch_size", 64), shuffle=False, num_workers=0)
-    print(f"Evaluating on {args.split}: {len(ds)} samples")
+    if not os.path.exists(split_path):
+        print(f"[ERROR] Split not found: {split_path}"); sys.exit(1)
 
-    # Collect scalar errors and targets for baseline eval
+    ds     = RemapDataset(split_path)
+    loader = DataLoader(ds, batch_size=cfg.get("batch_size", 64),
+                        shuffle=False, num_workers=0)
+    print(f"Evaluating on {args.split}: {len(ds)} samples, model={model_name}")
+
     raw = np.load(split_path, allow_pickle=True)
-    ne  = raw["nuisance_error"]   if "nuisance_error"   in raw else raw.get("sensory_error", np.zeros(len(ds)))
-    fve = raw["full_visual_error"] if "full_visual_error" in raw else np.zeros(len(ds))
+    raw = {k: raw[k] for k in raw.files}
+    ne  = raw.get("nuisance_error", raw.get("sensory_error", np.zeros(len(ds))))
+    fve = raw.get("full_visual_error", np.zeros(len(ds)))
     scalar_errors = np.stack([ne, fve, raw["future_error"],
                                raw["value_error"], raw["action_error"]], axis=1).astype(np.float32)
     targets = raw["target_multihot"].astype(np.float32)
     iids    = raw["intervention_id"]
 
-    # Neural model evaluation
+    # Load model
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = build_model(args.model).to(device)
+    model = build_model(model_name).to(device)
     model.load_state_dict(ckpt["model_state"])
-    model_overall, model_per = evaluate_model(model, loader, device)
 
-    print(f"\n=== Neural model ({args.model}) on {args.split} ===")
+    model_overall, model_per = evaluate_model(
+        model, loader, device, raw,
+        threshold=args.threshold,
+        compute_planning=is_gated,
+    )
+
+    print(f"\n=== Neural model ({model_name}) on {args.split} ===")
     print(f"  exact_match={model_overall['exact_match']:.3f} "
           f"micro_f1={model_overall['micro_f1']:.3f} "
           f"macro_f1={model_overall['macro_f1']:.3f}")
     print(f"  false_struct_remap={model_overall['false_structural_remap_on_sensory']:.3f}")
-    print(f"  per_label: " +
-          "  ".join(f"{l}={v['f1']:.3f}" for l, v in model_overall["per_label"].items()))
+    print(f"  action_delta_mse={model_overall['action_delta_mse']:.5f}")
+    if "planning" in model_overall:
+        pm = model_overall["planning"]
+        print(f"  planning: success={pm['planning_success_rate']:.3f} "
+              f"regret={pm['mean_step_regret']:.2f} failure={pm['failure_rate']:.3f}")
+    if "mean_gates_per_intervention" in model_overall:
+        print("  mean gates per intervention:")
+        for iname, gvals in model_overall["mean_gates_per_intervention"].items():
+            print(f"    {iname:25s}: {[f'{v:.3f}' for v in gvals]}")
 
-    eval_out = {"model": args.model, "split": args.split,
+    eval_out = {"model": model_name, "split": args.split, "threshold": args.threshold,
                 "overall": model_overall, "per_intervention": model_per}
     out_path = os.path.join(run_dir, f"eval_{args.split}.json")
     with open(out_path, "w") as f:
         json.dump(eval_out, f, indent=2)
     print(f"Saved model eval → {out_path}")
 
-    # Heuristic baseline evaluation
+    # Gate ablations
+    if args.gate_ablations and is_gated:
+        print(f"\n=== Gate ablations on {args.split} ===")
+        ablation_results = run_gate_ablations(model, loader, device, raw, args.threshold)
+        abl_path = os.path.join(run_dir, f"gate_ablation_eval_{args.split}.json")
+        with open(abl_path, "w") as f:
+            json.dump(ablation_results, f, indent=2)
+        print(f"Saved gate ablation eval → {abl_path}")
+
+    # Heuristic baselines
     print(f"\n=== Heuristic baselines on {args.split} ===")
     baseline_results = {}
     for BClass in ALL_BASELINES:
         bl = BClass()
-        bl_overall, bl_per = evaluate_baseline(bl, scalar_errors, targets, iids)
+        bl_overall, bl_per = evaluate_baseline(bl, scalar_errors, targets, iids, args.threshold)
         baseline_results[bl.name] = {"overall": bl_overall, "per_intervention": bl_per}
         print(f"  {bl.name:25s} exact={bl_overall['exact_match']:.3f} "
               f"micro_f1={bl_overall['micro_f1']:.3f} "

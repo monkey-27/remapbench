@@ -29,6 +29,8 @@ def main():
         n_val=cfg.get("n_val", 2000),
         n_test=cfg.get("n_test", 2000),
         n_composed=cfg.get("n_composed", 2000),
+        n_test_larger=cfg.get("n_test_larger", 0),
+        n_test_noisy=cfg.get("n_test_noisy", 0),
         gamma=cfg.get("gamma", 0.95),
     )
 

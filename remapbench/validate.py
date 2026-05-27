@@ -19,10 +19,11 @@ INTERVENTION_NAMES = {
 TARGET_NAMES = ["sensory_update", "value_remap", "map_remap", "action_remap"]
 
 # Per-sample pass thresholds
-THRESH_HIGH      = 0.01
-THRESH_NEAR_ZERO = 0.015
-MIN_PASS_RATE    = 0.90
-WEAK_ACTION_WARN = 0.20
+THRESH_HIGH       = 0.01
+THRESH_NEAR_ZERO  = 0.015
+MIN_PASS_RATE     = 0.90
+WEAK_ACTION_WARN  = 0.10   # warn if weak rate exceeds this
+WEAK_ACTION_FAIL  = 0.25   # hard fail if weak rate exceeds this
 
 
 def load_split(path):
@@ -227,10 +228,16 @@ def validate(data_dir):
             if ac_mask.sum() > 0:
                 weak_rate = float(data["weak_action_change"][ac_mask].mean())
                 diag["weak_action_change_rate"] = weak_rate
-                flag = "OK" if weak_rate <= WEAK_ACTION_WARN else "WARN"
+                if weak_rate <= WEAK_ACTION_WARN:
+                    flag = "OK"
+                elif weak_rate <= WEAK_ACTION_FAIL:
+                    flag = "WARN"
+                else:
+                    flag = "FAIL"
+                    all_ok = False
                 print(f"  weak_action_change_rate={weak_rate:.3f} → {flag}")
                 if weak_rate > WEAK_ACTION_WARN:
-                    print(f"    [WARN] weak_action_change_rate={weak_rate:.2f} > {WEAK_ACTION_WARN}")
+                    print(f"    [WARN] weak rate {weak_rate:.2f} > {WEAK_ACTION_WARN} (hard fail at {WEAK_ACTION_FAIL})")
 
         diagnostics[split_name] = diag
 

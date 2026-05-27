@@ -29,7 +29,8 @@ ACT_NAMES = ["up", "down", "left", "right"]
 # Grid generation
 # ---------------------------------------------------------------------------
 
-def make_grid(H, W, rng, wall_prob=0.25, min_free=10, min_path=6, max_tries=400):
+def make_grid(H, W, rng, wall_prob=0.25, min_free=10, min_path=6, max_tries=400,
+              nuisance_prob=0.15, distractor_prob=0.10):
     """
     Generate a random connected gridworld.
     Returns (grid [C,H,W] uint8, start_pos (r,c), goal_pos (r,c), reachable set).
@@ -66,9 +67,9 @@ def make_grid(H, W, rng, wall_prob=0.25, min_free=10, min_path=6, max_tries=400)
         for r, c in reachable_list:
             if (r, c) in (start_pos, goal_pos):
                 continue
-            if rng.random() < 0.15:
+            if rng.random() < nuisance_prob:
                 g[CH_NUISANCE, r, c] = 1
-            if rng.random() < 0.10:
+            if rng.random() < distractor_prob:
                 g[CH_DISTRACTOR, r, c] = 1
 
         return g, start_pos, goal_pos, reachable

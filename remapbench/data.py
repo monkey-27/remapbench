@@ -7,7 +7,7 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-    Dataset = object  # dummy base so class definition doesn't crash
+    Dataset = object
 
 
 class RemapDataset(Dataset):
@@ -18,6 +18,10 @@ class RemapDataset(Dataset):
         x:              float32 [2*C, H, W]  concat(before_grid, after_grid)
         before_grid:    float32 [C, H, W]
         after_grid:     float32 [C, H, W]
+        future_before:  float32 [1, H, W]
+        future_after:   float32 [1, H, W]
+        value_before:   float32 [1, H, W]
+        value_after:    float32 [1, H, W]
         delta_future:   float32 [1, H, W]
         delta_value:    float32 [1, H, W]
         action_delta:   float32 [4, H, W]
@@ -26,6 +30,8 @@ class RemapDataset(Dataset):
         intervention_id:int64  scalar
         layout_id:      int64  scalar
         sample_id:      int64  scalar
+        start_xy:       int64  [2]
+        goal_after_xy:  int64  [2]
     """
 
     def __init__(self, path):
@@ -40,8 +46,16 @@ class RemapDataset(Dataset):
 
     def __getitem__(self, idx):
         d = self._data
-        before = torch.from_numpy(d["before_grid"][idx].astype(np.float32))  # [C,H,W]
-        after  = torch.from_numpy(d["after_grid"][idx].astype(np.float32))   # [C,H,W]
+
+        def _t(key, dtype=np.float32):
+            return torch.from_numpy(d[key][idx].astype(dtype))
+
+        def _t1(key):
+            """Add channel dim: [H,W] → [1,H,W]."""
+            return torch.from_numpy(d[key][idx][np.newaxis].astype(np.float32))
+
+        before = _t("before_grid")  # [C,H,W]
+        after  = _t("after_grid")   # [C,H,W]
 
         ne  = float(d["nuisance_error"][idx])   if "nuisance_error"   in d else float(d.get("sensory_error", np.zeros(self._n))[idx])
         fve = float(d["full_visual_error"][idx]) if "full_visual_error" in d else 0.0
@@ -49,18 +63,22 @@ class RemapDataset(Dataset):
         ve  = float(d["value_error"][idx])
         ae  = float(d["action_error"][idx])
 
-        scalar_errors = torch.tensor([ne, fve, fe, ve, ae], dtype=torch.float32)
-
         return {
             "x":               torch.cat([before, after], dim=0),
             "before_grid":     before,
             "after_grid":      after,
-            "delta_future":    torch.from_numpy(d["delta_future"][idx][np.newaxis].astype(np.float32)),
-            "delta_value":     torch.from_numpy(d["delta_value"][idx][np.newaxis].astype(np.float32)),
-            "action_delta":    torch.from_numpy(d["action_delta"][idx].astype(np.float32)),
+            "future_before":   _t1("future_before"),
+            "future_after":    _t1("future_after"),
+            "value_before":    _t1("value_before"),
+            "value_after":     _t1("value_after"),
+            "delta_future":    _t1("delta_future"),
+            "delta_value":     _t1("delta_value"),
+            "action_delta":    _t("action_delta"),
             "target_multihot": torch.from_numpy(d["target_multihot"][idx].astype(np.float32)),
-            "scalar_errors":   scalar_errors,
+            "scalar_errors":   torch.tensor([ne, fve, fe, ve, ae], dtype=torch.float32),
             "intervention_id": torch.tensor(int(d["intervention_id"][idx]), dtype=torch.int64),
             "layout_id":       torch.tensor(int(d["layout_id"][idx]) if "layout_id" in d else idx, dtype=torch.int64),
             "sample_id":       torch.tensor(int(d["sample_id"][idx]) if "sample_id" in d else idx, dtype=torch.int64),
+            "start_xy":        torch.from_numpy(d["start_xy"][idx].astype(np.int64)),
+            "goal_after_xy":   torch.from_numpy(d["goal_after_xy"][idx].astype(np.int64)),
         }

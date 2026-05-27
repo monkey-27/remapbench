@@ -47,6 +47,8 @@ SEED_OFFSETS = {
     "val_single":     500_000,
     "test_single":    1_000_000,
     "test_composed":  1_500_000,
+    "test_larger":    2_000_000,
+    "test_noisy":     2_500_000,
 }
 
 
@@ -57,6 +59,7 @@ SEED_OFFSETS = {
 def _generate_one(
     layout_seed, intervention_seed, intervention_type, H, W, gamma, cfg,
     composed_pair_idx=None, sample_id=0,
+    nuisance_prob=0.15, distractor_prob=0.10,
 ):
     """Generate one sample with fully deterministic, per-sample seeds."""
     rng_layout = np.random.default_rng(layout_seed)
@@ -66,6 +69,8 @@ def _generate_one(
         H, W, rng_layout,
         wall_prob=cfg["wall_prob"],
         min_path=cfg["min_path"],
+        nuisance_prob=nuisance_prob,
+        distractor_prob=distractor_prob,
     )
 
     if intervention_type == "composed":
@@ -103,6 +108,7 @@ def _generate_one(
 def generate_split(
     n, intervention_schedule, split_name, seed_offset, H, W, gamma, cfg, verbose=True,
     composed_pair_schedule=None, global_id_offset=0,
+    nuisance_prob=0.15, distractor_prob=0.10,
 ):
     """Generate n samples for a split. intervention_schedule is length-n list of type strings."""
     samples = []
@@ -122,6 +128,8 @@ def generate_split(
                     layout_seed, inter_seed, itype, H, W, gamma, cfg,
                     composed_pair_idx=cidx,
                     sample_id=global_sample_id,
+                    nuisance_prob=nuisance_prob,
+                    distractor_prob=distractor_prob,
                 )
                 samples.append(sample)
                 success = True
@@ -177,6 +185,7 @@ def load_split(path):
 def generate_dataset(
     out_dir, seed=0, H=10, W=10,
     n_train=12000, n_val=2000, n_test=2000, n_composed=2000,
+    n_test_larger=0, n_test_noisy=0,
     gamma=0.95, verbose=True,
 ):
     os.makedirs(out_dir, exist_ok=True)
@@ -222,6 +231,34 @@ def generate_dataset(
         splits[split_name] = samples
         global_id += n
 
+    # test_larger: larger grid (12x12)
+    if n_test_larger > 0:
+        split_name = "test_larger"
+        H_lg, W_lg = 12, 12
+        seed_offset = SEED_OFFSETS["test_larger"] + seed * 100
+        print(f"Generating {split_name} ({n_test_larger} samples, grid={H_lg}x{W_lg})...")
+        itype_sched = _balanced_schedule(n_test_larger, SINGLE_INTERVENTIONS, master_rng)
+        samples = generate_split(
+            n_test_larger, itype_sched, split_name, seed_offset, H_lg, W_lg, gamma, cfg, verbose,
+            global_id_offset=global_id,
+        )
+        splits[split_name] = samples
+        global_id += n_test_larger
+
+    # test_noisy: higher nuisance/distractor density
+    if n_test_noisy > 0:
+        split_name = "test_noisy"
+        seed_offset = SEED_OFFSETS["test_noisy"] + seed * 100
+        print(f"Generating {split_name} ({n_test_noisy} samples, noisy)...")
+        itype_sched = _balanced_schedule(n_test_noisy, SINGLE_INTERVENTIONS, master_rng)
+        samples = generate_split(
+            n_test_noisy, itype_sched, split_name, seed_offset, H, W, gamma, cfg, verbose,
+            global_id_offset=global_id,
+            nuisance_prob=0.35, distractor_prob=0.25,
+        )
+        splits[split_name] = samples
+        global_id += n_test_noisy
+
     # Save
     print("Saving splits...")
     for split_name, samples in splits.items():
@@ -264,19 +301,22 @@ def generate_dataset(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate RemapBench dataset")
-    parser.add_argument("--out",       default="data/remapbench_v0")
-    parser.add_argument("--seed",      type=int, default=0)
-    parser.add_argument("--grid_size", type=int, default=10)
-    parser.add_argument("--n_train",   type=int, default=12000)
-    parser.add_argument("--n_val",     type=int, default=2000)
-    parser.add_argument("--n_test",    type=int, default=2000)
-    parser.add_argument("--n_composed",type=int, default=2000)
-    parser.add_argument("--gamma",     type=float, default=0.95)
+    parser.add_argument("--out",            default="data/remapbench_v0")
+    parser.add_argument("--seed",           type=int, default=0)
+    parser.add_argument("--grid_size",      type=int, default=10)
+    parser.add_argument("--n_train",        type=int, default=12000)
+    parser.add_argument("--n_val",          type=int, default=2000)
+    parser.add_argument("--n_test",         type=int, default=2000)
+    parser.add_argument("--n_composed",     type=int, default=2000)
+    parser.add_argument("--n_test_larger",  type=int, default=0)
+    parser.add_argument("--n_test_noisy",   type=int, default=0)
+    parser.add_argument("--gamma",          type=float, default=0.95)
     args = parser.parse_args()
     generate_dataset(
         out_dir=args.out, seed=args.seed, H=args.grid_size, W=args.grid_size,
         n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-        n_composed=args.n_composed, gamma=args.gamma,
+        n_composed=args.n_composed, n_test_larger=args.n_test_larger,
+        n_test_noisy=args.n_test_noisy, gamma=args.gamma,
     )
 
 
