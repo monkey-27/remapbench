@@ -1,0 +1,17 @@
+data_dir: data/remapbench_v0
+grid_size: 10
+seed: 0
+n_train: 12000
+n_val: 2000
+n_test: 2000
+n_composed: 2000
+gamma: 0.95
+batch_size: 128
+epochs: 30
+lr: 0.001
+run_name: pilot_erpm_seed0
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0

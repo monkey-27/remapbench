@@ -2,6 +2,9 @@
 Validation script.
 Usage:
     python -m remapbench.validate --data_dir data/remapbench_v0
+
+Reports class counts, per-sample pass rates, layout_id leakage check,
+NaN/Inf checks, and weak_action_change rate. Writes diagnostics.json.
 """
 import argparse
 import json
@@ -9,154 +12,229 @@ import os
 import sys
 import numpy as np
 
-INTERVENTION_NAMES = {0: "sensory_nuisance", 1: "goal_relocation",
-                      2: "topology_change", 3: "action_change", 4: "composed"}
-SEED_OFFSETS = {"train_single": 0, "val_single": 500_000,
-                "test_single": 1_000_000, "test_composed": 1_500_000}
+INTERVENTION_NAMES = {
+    0: "sensory_nuisance", 1: "goal_relocation",
+    2: "topology_change",  3: "action_change", 4: "composed",
+}
+TARGET_NAMES = ["sensory_update", "value_remap", "map_remap", "action_remap"]
 
-# Validation thresholds
-THRESH_HIGH = 0.01     # error must be ABOVE this to count as "high"
-THRESH_NEAR_ZERO = 0.015  # error must be BELOW this to count as "near zero"
+# Per-sample pass thresholds
+THRESH_HIGH      = 0.01
+THRESH_NEAR_ZERO = 0.015
+MIN_PASS_RATE    = 0.90
+WEAK_ACTION_WARN = 0.20
 
 
 def load_split(path):
-    data = np.load(path, allow_pickle=True)
-    return {k: data[k] for k in data.files}
+    d = np.load(path, allow_pickle=True)
+    return {k: d[k] for k in d.files}
 
 
-def stats(arr):
+def _stats(arr):
     return {"mean": float(np.mean(arr)), "std": float(np.std(arr)),
             "min": float(np.min(arr)), "max": float(np.max(arr))}
 
 
+def _check_sample_sensory(s):
+    return (float(s["nuisance_error"]) > THRESH_HIGH and
+            float(s["future_error"])   < THRESH_NEAR_ZERO and
+            float(s["value_error"])    < THRESH_NEAR_ZERO and
+            float(s["action_error"])   < THRESH_NEAR_ZERO)
+
+
+def _check_sample_goal(s):
+    return (float(s["value_error"])  > THRESH_HIGH and
+            float(s["future_error"]) < THRESH_NEAR_ZERO and
+            float(s["action_error"]) < THRESH_NEAR_ZERO)
+
+
+def _check_sample_topology(s):
+    return float(s["future_error"]) > THRESH_HIGH
+
+
+def _check_sample_action(s):
+    return float(s["action_error"]) > THRESH_HIGH
+
+
+def _check_sample_composed(s):
+    mh = s["target_multihot"]
+    return int(mh.sum()) >= 2
+
+
+_CHECKERS = {
+    0: _check_sample_sensory,
+    1: _check_sample_goal,
+    2: _check_sample_topology,
+    3: _check_sample_action,
+    4: _check_sample_composed,
+}
+
+
+def _sample_at(data, i):
+    """Return a per-row dict view of a stacked-array data dict."""
+    return {k: v[i] for k, v in data.items()}
+
+
 def validate(data_dir):
     split_files = {
-        "train_single": "train_single.npz",
-        "val_single":   "val_single.npz",
-        "test_single":  "test_single.npz",
-        "test_composed":"test_composed.npz",
+        "train_single":  "train_single.npz",
+        "val_single":    "val_single.npz",
+        "test_single":   "test_single.npz",
+        "test_composed": "test_composed.npz",
     }
 
     splits = {}
     for name, fname in split_files.items():
         path = os.path.join(data_dir, fname)
-        if not os.path.exists(path):
+        if os.path.exists(path):
+            splits[name] = load_split(path)
+            print(f"Loaded {name}: {len(splits[name]['intervention_id'])} samples")
+        else:
             print(f"  [SKIP] {path} not found")
-            continue
-        splits[name] = load_split(path)
-        print(f"Loaded {name}: {len(splits[name]['intervention_id'])} samples")
 
     diagnostics = {}
     all_ok = True
 
+    # -----------------------------------------------------------------------
+    # NaN / Inf check
+    # -----------------------------------------------------------------------
+    print("\n--- NaN/Inf checks ---")
+    for split_name, data in splits.items():
+        float_keys = ["delta_future", "delta_value", "action_delta",
+                      "future_before", "future_after", "value_before", "value_after",
+                      "nuisance_error", "full_visual_error", "future_error",
+                      "value_error", "action_error"]
+        bad = []
+        for k in float_keys:
+            if k not in data:
+                continue
+            arr = data[k].astype(np.float32)
+            if not np.isfinite(arr).all():
+                bad.append(k)
+        flag = "OK" if not bad else f"FAIL: {bad}"
+        print(f"  {split_name}: {flag}")
+        if bad:
+            all_ok = False
+
+    # -----------------------------------------------------------------------
+    # Layout ID leakage check
+    # -----------------------------------------------------------------------
+    print("\n--- Layout ID leakage ---")
+    layout_id_sets = {}
+    for split_name, data in splits.items():
+        if "layout_id" in data:
+            layout_id_sets[split_name] = set(data["layout_id"].tolist())
+        else:
+            layout_id_sets[split_name] = set()
+
+    leakage_free = True
+    split_names = list(layout_id_sets.keys())
+    for i in range(len(split_names)):
+        for j in range(i + 1, len(split_names)):
+            sa, sb = split_names[i], split_names[j]
+            overlap = layout_id_sets[sa] & layout_id_sets[sb]
+            if overlap:
+                print(f"  FAIL: {sa} ∩ {sb} = {len(overlap)} shared layout IDs")
+                leakage_free = False
+            else:
+                print(f"  OK: {sa} ∩ {sb} = empty")
+    if leakage_free:
+        print("  All layout IDs are disjoint across splits.")
+    diagnostics["leakage_free"] = leakage_free
+    if not leakage_free:
+        all_ok = False
+
+    # -----------------------------------------------------------------------
+    # Per-split analysis
+    # -----------------------------------------------------------------------
     for split_name, data in splits.items():
         print(f"\n=== {split_name} ===")
         iids = data["intervention_id"]
         n = len(iids)
-        diag = {"n_samples": int(n)}
+        diag = {"n_samples": int(n), "class_counts": {}, "error_stats": {},
+                "pass_rates": {}, "target_label_counts": {}}
 
         # Class counts
-        counts = {}
-        for iid in np.unique(iids):
+        for iid in sorted(np.unique(iids)):
             cnt = int((iids == iid).sum())
             name = INTERVENTION_NAMES.get(int(iid), f"id{iid}")
-            counts[name] = cnt
+            diag["class_counts"][name] = cnt
             print(f"  {name}: {cnt}")
-        diag["class_counts"] = counts
 
-        # Per-intervention error statistics
-        error_keys = ["sensory_error", "future_error", "value_error", "action_error"]
-        diag["error_stats"] = {}
-        for iid_val, iname in INTERVENTION_NAMES.items():
+        # target_multihot validation
+        mh = data["target_multihot"]
+        assert mh.shape[1] == 4, f"target_multihot shape mismatch: {mh.shape}"
+        for i, lname in enumerate(TARGET_NAMES):
+            cnt = int(mh[:, i].sum())
+            diag["target_label_counts"][lname] = cnt
+        print(f"  label counts: {diag['target_label_counts']}")
+
+        is_single = "single" in split_name
+        is_composed = "composed" in split_name
+
+        if is_single:
+            sums = mh.sum(axis=1)
+            n_bad = int((sums != 1).sum())
+            if n_bad > 0:
+                print(f"  [WARN] {n_bad} single samples with target_sum != 1")
+
+        if is_composed:
+            sums = mh.sum(axis=1)
+            n_bad = int((sums < 2).sum())
+            ok = n_bad == 0
+            print(f"  [assert composed ≥2 labels]: {'OK' if ok else f'FAIL ({n_bad} samples < 2 active)'}")
+            if not ok:
+                all_ok = False
+
+        # Per-intervention error stats + pass rates
+        for iid_val in sorted(np.unique(iids)):
             mask = iids == iid_val
             if mask.sum() == 0:
                 continue
-            row = {}
-            for ek in error_keys:
+            iname = INTERVENTION_NAMES.get(int(iid_val), f"id{iid_val}")
+            row_diag = {}
+
+            err_keys = ["nuisance_error", "full_visual_error", "future_error",
+                        "value_error", "action_error"]
+            err_stats = {}
+            for ek in err_keys:
                 if ek in data:
-                    row[ek] = stats(data[ek][mask])
-            diag["error_stats"][iname] = row
-            means = {ek: row[ek]["mean"] for ek in error_keys if ek in row}
-            print(f"  {iname:25s} "
-                  + "  ".join(f"{k.split('_')[0][:3]}={v:.4f}" for k, v in means.items()))
+                    err_stats[ek] = _stats(data[ek][mask])
+            row_diag["error_stats"] = err_stats
 
-        # Leakage check: layout seeds per split should be in disjoint ranges
-        offset = SEED_OFFSETS.get(split_name, 0)
-        diag["seed_offset"] = offset
+            means = {k: v["mean"] for k, v in err_stats.items()}
+            print(f"  {iname:25s} " +
+                  "  ".join(f"{k.split('_')[0][:4]}={v:.4f}" for k, v in means.items()))
 
-        # Assertions for single-intervention splits
-        if "single" in split_name:
-            for iid_val, iname in INTERVENTION_NAMES.items():
-                if iid_val == 4:
-                    continue
-                mask = iids == iid_val
-                if mask.sum() == 0:
-                    continue
+            # Per-sample pass rate
+            checker = _CHECKERS.get(int(iid_val))
+            if checker:
+                idxs = np.where(mask)[0]
+                passes = sum(1 for i in idxs if checker(_sample_at(data, i)))
+                pass_rate = passes / len(idxs)
+                row_diag["pass_rate"] = pass_rate
+                ok = pass_rate >= MIN_PASS_RATE
+                flag = "OK" if ok else "FAIL"
+                print(f"    pass_rate={pass_rate:.3f} (≥{MIN_PASS_RATE}) → {flag}")
+                if not ok:
+                    all_ok = False
 
-                se = data["sensory_error"][mask].mean() if "sensory_error" in data else 0
-                fe = data["future_error"][mask].mean() if "future_error" in data else 0
-                ve = data["value_error"][mask].mean() if "value_error" in data else 0
-                ae = data["action_error"][mask].mean() if "action_error" in data else 0
+            diag["error_stats"][iname] = row_diag
 
-                if iname == "sensory_nuisance":
-                    ok = se > THRESH_HIGH and fe < THRESH_NEAR_ZERO and ve < THRESH_NEAR_ZERO and ae < THRESH_NEAR_ZERO
-                    flag = "OK" if ok else "FAIL"
-                    if not ok:
-                        all_ok = False
-                    print(f"  [assert sensory_nuisance] se={se:.4f}>{THRESH_HIGH} "
-                          f"fe={fe:.4f}<{THRESH_NEAR_ZERO} "
-                          f"ve={ve:.4f}<{THRESH_NEAR_ZERO} "
-                          f"ae={ae:.4f}<{THRESH_NEAR_ZERO} → {flag}")
-
-                elif iname == "goal_relocation":
-                    ok = ve > THRESH_HIGH and fe < THRESH_NEAR_ZERO and ae < THRESH_NEAR_ZERO
-                    flag = "OK" if ok else "FAIL"
-                    if not ok:
-                        all_ok = False
-                    print(f"  [assert goal_relocation] ve={ve:.4f}>{THRESH_HIGH} "
-                          f"fe={fe:.4f}<{THRESH_NEAR_ZERO} "
-                          f"ae={ae:.4f}<{THRESH_NEAR_ZERO} → {flag}")
-
-                elif iname == "topology_change":
-                    ok = fe > THRESH_HIGH
-                    flag = "OK" if ok else "FAIL"
-                    if not ok:
-                        all_ok = False
-                    print(f"  [assert topology_change] fe={fe:.4f}>{THRESH_HIGH} → {flag}")
-
-                elif iname == "action_change":
-                    ok = ae > THRESH_HIGH
-                    flag = "OK" if ok else "FAIL"
-                    if not ok:
-                        all_ok = False
-                    print(f"  [assert action_change] ae={ae:.4f}>{THRESH_HIGH} → {flag}")
-
-        # Composed: at least two active target labels
-        if split_name == "test_composed":
-            mh = data["target_multihot"]  # [N, 4]
-            active = mh.sum(axis=1)
-            ok = bool((active >= 2).all())
-            flag = "OK" if ok else "FAIL"
-            if not ok:
-                all_ok = False
-                bad = (active < 2).sum()
-                print(f"  [assert composed multi-label] {bad} samples with <2 active labels → {flag}")
-            else:
-                print(f"  [assert composed multi-label] all samples have >=2 active labels → {flag}")
+        # weak_action_change rate
+        if "weak_action_change" in data:
+            ac_mask = iids == 3  # action_change id
+            if ac_mask.sum() > 0:
+                weak_rate = float(data["weak_action_change"][ac_mask].mean())
+                diag["weak_action_change_rate"] = weak_rate
+                flag = "OK" if weak_rate <= WEAK_ACTION_WARN else "WARN"
+                print(f"  weak_action_change_rate={weak_rate:.3f} → {flag}")
+                if weak_rate > WEAK_ACTION_WARN:
+                    print(f"    [WARN] weak_action_change_rate={weak_rate:.2f} > {WEAK_ACTION_WARN}")
 
         diagnostics[split_name] = diag
 
-    # Leakage check: verify seed offsets are disjoint across splits (by design)
-    loaded_offsets = {k: SEED_OFFSETS[k] for k in splits}
-    offset_values = list(loaded_offsets.values())
-    leakage_free = len(set(offset_values)) == len(offset_values)
-    print(f"\n[assert leakage-free] disjoint seed offsets: {loaded_offsets} → {'OK' if leakage_free else 'FAIL'}")
-    if not leakage_free:
-        all_ok = False
-
-    diagnostics["leakage_free"] = leakage_free
     diagnostics["all_assertions_passed"] = all_ok
-
     out_path = os.path.join(data_dir, "diagnostics.json")
     with open(out_path, "w") as f:
         json.dump(diagnostics, f, indent=2)

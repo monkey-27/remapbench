@@ -2,5 +2,8 @@ __pycache__/
 *.pyc
 data/
 figures/
+results/
 *.npz
-*.json
+*.pt
+*.jsonl
+diagnostics.json
