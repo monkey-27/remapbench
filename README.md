@@ -63,11 +63,12 @@ Planning metrics: `planning_success_rate`, `mean_step_regret` vs oracle directed
 pip install -r requirements.txt
 ```
 
-### Smoke commands (fast, run these first)
+### Smoke / preflight commands (fast, run these first)
 
 ```bash
 python scripts/generate_data.py  --config configs/smoke.yaml
 python -m remapbench.validate    --data_dir data/smoke
+python scripts/audit_dataset.py  --data_dir data/smoke --out data/smoke/audit_report.json
 python -m remapbench.visualize   --data_dir data/smoke --out_dir figures/smoke --n 4
 python scripts/train.py          --config configs/smoke.yaml
 python scripts/evaluate.py       --config configs/smoke.yaml \
@@ -78,6 +79,14 @@ python scripts/check_gates.py    --config configs/smoke.yaml \
     --checkpoint results/smoke_gated_erpm/best.pt --split test_single
 python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/smoke_gated_erpm
 ```
+
+`validate` checks array well-formedness and broad per-sample thresholds.
+`audit_dataset` is a **stricter scientific-validity gate** — it must report
+`PILOT READY: YES` before launching a full pilot (run with `--strict` to make a
+failing audit exit nonzero). It checks split integrity (provably-disjoint layout
+IDs, unique sample IDs, class balance), per-class signal strength, scalar-error
+separability (nearest-centroid sanity check), behavioral meaningfulness of
+topology/action changes, and channel-leakage artifacts.
 
 ### Pilot commands *(longer run; do not run by default)*
 
@@ -112,8 +121,10 @@ models/
     baselines.py     – heuristic baselines
 scripts/
     generate_data.py – config-driven data generation
+    audit_dataset.py – strict scientific-validity audit + pilot-readiness decision
     train.py         – training loop (supports gated losses)
     evaluate.py      – evaluation + baseline comparison + gate ablations + planning
+    check_gates.py   – gate-override sanity check
     make_plots.py    – paper-style figures (gate heatmap, ablation, planning regret)
 configs/
     smoke.yaml       – smoke test config (200 train, 2 epochs, gated_erpm)
@@ -224,26 +235,48 @@ Reverse BFS from goal under directed transitions.
 | `layout_id`, `sample_id`, `layout_seed` | int64 | scalar |
 | `intervention_seed`, `intervention_pair_id` | int64 | scalar |
 | `weak_action_change` | int64 | scalar (0/1) |
+| `action_cell_row`, `action_cell_col` | int64 | scalar (−1 if not action_change) |
+| `action_cell_on_path`, `action_cell_near_path` | uint8 | scalar (0/1) |
+| `action_path_action_changed`, `action_path_len_changed` | uint8 | scalar (0/1) |
+
+**Action-change relevance metadata** records *where* the one-way cell was placed
+relative to the original shortest path (on-path / near-path) and *how* it changed
+behavior (path-action redirected / directed path length changed). Non-action samples
+use defaults (−1 / 0). The audit uses these to confirm action changes are
+behaviorally meaningful rather than cosmetic local perturbations.
 
 ---
 
 ## Dataset Splits
 
-| Split | Default size | Intervention types | Seed offset |
-|-------|--------------|--------------------|-------------|
-| `train_single` | 12 000 | balanced single | 0 |
-| `val_single` | 2 000 | balanced single | 500 000 |
-| `test_single` | 2 000 | balanced single | 1 000 000 |
-| `test_composed` | 2 000 | balanced composed | 1 500 000 |
-| `test_larger` | 0 (1 000 in pilot) | balanced single, 12×12 | 2 000 000 |
-| `test_noisy` | 0 (1 000 in pilot) | balanced single, noisy | 2 500 000 |
+| Split | split_id | Default size | Intervention types |
+|-------|----------|--------------|--------------------|
+| `train_single` | 0 | 12 000 | balanced single |
+| `val_single` | 1 | 2 000 | balanced single |
+| `test_single` | 2 | 2 000 | balanced single |
+| `test_composed` | 3 | 2 000 | balanced composed |
+| `test_larger` | 4 | 0 (1 000 in pilot) | balanced single, 12×12 |
+| `test_noisy` | 5 | 0 (1 000 in pilot) | balanced single, noisy |
 
 `test_larger`: 12×12 grid (vs default 10×10), tests generalisation to unseen grid size.
 `test_noisy`: higher nuisance density (`nuisance_prob=0.35`, `distractor_prob=0.25`).
 
-Each sample uses a unique layout seed derived from its global index.
-Disjoint seed offset ranges guarantee **no layout leakage across splits**.
-`validate.py` verifies `layout_id` disjointness explicitly.
+**Provably-disjoint layout IDs and seeds.** Layout IDs and RNG seeds are derived
+arithmetically from `(seed, split_id, sample_index, attempt)`:
+
+```
+layout_id         = split_id * 1_000_000_000 + sample_index      # attempt-independent
+base_seed         = seed * 10_000_000_000
+layout_seed       = base_seed + split_id * 100_000_000 + i * max_sample_tries + attempt
+intervention_seed = layout_seed + 50_000_000
+```
+
+Because `layout_id` depends only on `split_id` and `sample_index` (and indices are
+far below the 1e9 stride), layout IDs occupy **non-overlapping billion-spaced ranges
+per split** — collisions are impossible by construction, not merely checked after the
+fact. The old additive `SEED_OFFSETS` scheme (which could theoretically collide) is
+retained in metadata only as `seed_offsets_DEPRECATED`. `validate.py` and
+`audit_dataset.py` still verify `layout_id` disjointness empirically.
 
 ---
 
@@ -365,8 +398,18 @@ Generates in `results/{run_name}/figures/`:
    pipeline check only. Run `configs/pilot.yaml` (30 epochs) for meaningful results.
 
 5. **`action_change` behavioural relevance**: a `weak_action_change=1` flag marks
-   fallback samples where path-relevance could not be confirmed. Monitor the weak
-   rate (warn >10%, hard fail >25%) in diagnostics.json.
+   fallback samples where path-relevance could not be confirmed. Generation now
+   rejects weak action samples that have no path/value/future effect, and the audit
+   hard-fails if the weak rate exceeds 0.20 or the meaningful fraction drops below
+   0.50. Topology samples are likewise rejected unless they produce a real
+   future/path/value change (audit requires ≥0.70 meaningful). Action-relevance
+   metadata (`action_cell_*`) is stored per sample.
+
+6. **Dataset audit is preflight, not proof of learnability**: `audit_dataset.py`
+   confirms the *labels are dissociable from scalar errors and behaviorally grounded*
+   (nearest-centroid separability ~0.85–0.92 on clean data — high but not a perfect
+   artifact). It does not guarantee the neural model will learn the mapping; that is
+   what the pilot run measures.
 
 6. **Planning metric requires converged model**: the greedy value-following policy
    relies on `value_after` predictions. With untrained or 2-epoch smoke models the

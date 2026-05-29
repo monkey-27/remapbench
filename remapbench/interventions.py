@@ -1,9 +1,12 @@
 """
 Intervention generators for RemapBench.
-Each applier returns a 5-tuple:
-  (new_grid, new_goal, intervention_name, target_multihot, weak_action_change)
-Composed returns a 6-tuple:
-  (new_grid, new_goal, "composed", target_multihot, composed_pair, weak_action_change)
+
+All appliers (single and composed) now return a normalized 6-tuple:
+  (new_grid, new_goal, intervention_name, target_multihot, weak_action_change, extra_meta)
+
+extra_meta is a dict. For action_change it carries cell/path-relevance metadata
+(see DEFAULT_ACTION_META). For composed samples it additionally carries
+"composed_pair" (the pair tuple). Non-action single interventions use defaults.
 """
 import numpy as np
 from collections import deque
@@ -12,6 +15,16 @@ from .env import (
     CH_DOOR, ONE_WAY_CHANNELS, ACT_DR, ACT_DC,
     bfs_reachable_undirected, bfs_dist_undirected, build_transition, directed_path_len,
 )
+
+# Default action-change relevance metadata (used for all non-action samples).
+DEFAULT_ACTION_META = {
+    "action_cell_row": -1,
+    "action_cell_col": -1,
+    "action_cell_on_path": 0,
+    "action_cell_near_path": 0,
+    "action_path_action_changed": 0,
+    "action_path_len_changed": 0,
+}
 
 # target_multihot indices: [sensory_update, value_remap, map_remap, action_remap]
 MULTIHOT_SENSORY = [1, 0, 0, 0]   # sensory pathway updates; predictive map stable
@@ -100,7 +113,7 @@ def apply_sensory_nuisance(grid, start, goal, rng):
         ).mean()
         if diff < THRESH_SENSORY:
             continue
-        return g2, goal, "sensory_nuisance", MULTIHOT_SENSORY, 0
+        return g2, goal, "sensory_nuisance", MULTIHOT_SENSORY, 0, dict(DEFAULT_ACTION_META)
 
     raise ValueError("sensory_nuisance: could not find valid change")
 
@@ -131,7 +144,7 @@ def apply_goal_relocation(grid, start, goal, rng):
         g2 = _copy_grid(grid)
         g2[CH_GOAL, goal[0], goal[1]] = 0
         g2[CH_GOAL, new_goal[0], new_goal[1]] = 1
-        return g2, new_goal, "goal_relocation", MULTIHOT_VALUE, 0
+        return g2, new_goal, "goal_relocation", MULTIHOT_VALUE, 0, dict(DEFAULT_ACTION_META)
 
     # Relax path-change requirement
     for new_goal in candidates:
@@ -140,7 +153,7 @@ def apply_goal_relocation(grid, start, goal, rng):
             g2 = _copy_grid(grid)
             g2[CH_GOAL, goal[0], goal[1]] = 0
             g2[CH_GOAL, new_goal[0], new_goal[1]] = 1
-            return g2, new_goal, "goal_relocation", MULTIHOT_VALUE, 0
+            return g2, new_goal, "goal_relocation", MULTIHOT_VALUE, 0, dict(DEFAULT_ACTION_META)
 
     raise ValueError("goal_relocation: no valid new goal found")
 
@@ -175,7 +188,7 @@ def apply_topology_change(grid, start, goal, rng):
                         continue
                     if not relaxed and abs(path_after - path_before) < MIN_PATH_CHANGE_TOPO:
                         continue
-                    return g2, goal, "topology_change", MULTIHOT_MAP, 0
+                    return g2, goal, "topology_change", MULTIHOT_MAP, 0, dict(DEFAULT_ACTION_META)
 
             elif strategy == "open":
                 walls_rc = [
@@ -194,7 +207,7 @@ def apply_topology_change(grid, start, goal, rng):
                         continue
                     if not relaxed and abs(path_after - path_before) < MIN_PATH_CHANGE_TOPO:
                         continue
-                    return g2, goal, "topology_change", MULTIHOT_MAP, 0
+                    return g2, goal, "topology_change", MULTIHOT_MAP, 0, dict(DEFAULT_ACTION_META)
 
     raise ValueError("topology_change: could not find valid topology modification")
 
@@ -218,6 +231,22 @@ def _orig_path_action(path, r, c):
     return -1
 
 
+def _action_meta(r, c, d, pl_after, pl_before_dir, path, on_path_flag, near_flag):
+    """Build action-change relevance metadata for an accepted placement."""
+    orig_act = _orig_path_action(path, r, c) if on_path_flag else -1
+    path_act_changed = 1 if (orig_act >= 0 and d != orig_act) else 0
+    path_len_changed = 1 if (pl_after >= 0 and pl_before_dir >= 0
+                             and abs(pl_after - pl_before_dir) >= 1) else 0
+    return {
+        "action_cell_row": int(r),
+        "action_cell_col": int(c),
+        "action_cell_on_path": 1 if on_path_flag else 0,
+        "action_cell_near_path": 1 if near_flag else 0,
+        "action_path_action_changed": path_act_changed,
+        "action_path_len_changed": path_len_changed,
+    }
+
+
 def apply_action_change(grid, start, goal, rng):
     """
     Add one-way behavior on a path-relevant free cell.
@@ -231,6 +260,8 @@ def apply_action_change(grid, start, goal, rng):
     Weak (weak=1) fallback:
       - Near-path cell with no path-length change, OR
       - Any free cell (last resort).
+
+    Returns extra_meta with cell/path-relevance fields (see DEFAULT_ACTION_META).
     """
     H, W = grid.shape[1], grid.shape[2]
     path = _shortest_path_cells(grid, start, goal)
@@ -239,6 +270,7 @@ def apply_action_change(grid, start, goal, rng):
 
     reachable = bfs_reachable_undirected(grid, start)
     T_before = build_transition(grid)
+    pl_before_dir = directed_path_len(T_before, start, goal, W)
 
     near_path = {
         (r + dr, c + dc)
@@ -286,7 +318,8 @@ def apply_action_change(grid, start, goal, rng):
         orig_act = _orig_path_action(path, r, c)
         path_act_changed   = (orig_act >= 0 and d != orig_act)
         if path_len_changed or path_act_changed:
-            return g2, goal, "action_change", MULTIHOT_ACTION, 0  # strong
+            meta = _action_meta(r, c, d, pl_after, pl_before_dir, path, True, True)
+            return g2, goal, "action_change", MULTIHOT_ACTION, 0, meta  # strong
 
     # Tier 2: near path — strong only if path_len changes
     for (r, c) in near_only:
@@ -295,7 +328,8 @@ def apply_action_change(grid, start, goal, rng):
             continue
         g2, T2, pl_after, d = res
         if abs(pl_after - path_before) >= 1:
-            return g2, goal, "action_change", MULTIHOT_ACTION, 0  # strong
+            meta = _action_meta(r, c, d, pl_after, pl_before_dir, path, False, True)
+            return g2, goal, "action_change", MULTIHOT_ACTION, 0, meta  # strong
 
     # Tier 3: on path — weak (path action didn't change in a behaviorally strong way)
     for (r, c) in on_path:
@@ -303,7 +337,8 @@ def apply_action_change(grid, start, goal, rng):
         if res is None:
             continue
         g2, T2, pl_after, d = res
-        return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak: on path but no strong criterion
+        meta = _action_meta(r, c, d, pl_after, pl_before_dir, path, True, True)
+        return g2, goal, "action_change", MULTIHOT_ACTION, 1, meta  # weak
 
     # Tier 4: near path — weak (no path-length change)
     for (r, c) in near_only:
@@ -311,7 +346,8 @@ def apply_action_change(grid, start, goal, rng):
         if res is None:
             continue
         g2, T2, pl_after, d = res
-        return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak
+        meta = _action_meta(r, c, d, pl_after, pl_before_dir, path, False, True)
+        return g2, goal, "action_change", MULTIHOT_ACTION, 1, meta  # weak
 
     # Tier 5: any free cell — weak fallback
     for (r, c) in all_free:
@@ -319,7 +355,8 @@ def apply_action_change(grid, start, goal, rng):
         if res is None:
             continue
         g2, T2, pl_after, d = res
-        return g2, goal, "action_change", MULTIHOT_ACTION, 1  # weak
+        meta = _action_meta(r, c, d, pl_after, pl_before_dir, path, False, False)
+        return g2, goal, "action_change", MULTIHOT_ACTION, 1, meta  # weak
 
     raise ValueError("action_change: could not find valid one-way placement")
 
@@ -350,6 +387,15 @@ _APPLIERS = {
 }
 
 
+def _merge_action_meta(m1, m2):
+    """Prefer whichever sub-intervention meta carries a real action cell."""
+    if m1.get("action_cell_row", -1) != -1:
+        return dict(m1)
+    if m2.get("action_cell_row", -1) != -1:
+        return dict(m2)
+    return dict(DEFAULT_ACTION_META)
+
+
 def apply_composed(grid, start, goal, rng, pair_idx=None):
     if pair_idx is None:
         pair_idx = int(rng.integers(len(COMPOSED_PAIRS)))
@@ -358,13 +404,15 @@ def apply_composed(grid, start, goal, rng, pair_idx=None):
     multihot = COMPOSED_MULTIHOT[pair]
 
     fn1 = _APPLIERS[pair[0]]
-    g1, goal1, _, _, weak1 = fn1(grid, start, goal, rng)
+    g1, goal1, _, _, weak1, meta1 = fn1(grid, start, goal, rng)
 
     fn2 = _APPLIERS[pair[1]]
     for _ in range(MAX_TRIES):
         try:
-            g2, goal2, _, _, weak2 = fn2(g1, start, goal1, rng)
-            return g2, goal2, "composed", multihot, pair, max(weak1, weak2)
+            g2, goal2, _, _, weak2, meta2 = fn2(g1, start, goal1, rng)
+            extra = _merge_action_meta(meta1, meta2)
+            extra["composed_pair"] = pair
+            return g2, goal2, "composed", multihot, max(weak1, weak2), extra
         except ValueError:
             pass
 
@@ -373,19 +421,13 @@ def apply_composed(grid, start, goal, rng, pair_idx=None):
 
 def apply_intervention(grid, start, goal, rng, intervention_type, composed_pair_idx=None):
     """
-    Dispatch to correct intervention.
-    Single: returns (new_grid, new_goal, name, multihot, weak_action_change).
-    Composed: returns (new_grid, new_goal, name, multihot, pair_tuple, weak_action_change).
+    Dispatch to the correct intervention. All branches return a normalized 6-tuple:
+      (new_grid, new_goal, name, multihot, weak_action_change, extra_meta)
+    For composed, extra_meta additionally contains "composed_pair".
     """
-    if intervention_type == "sensory_nuisance":
-        return apply_sensory_nuisance(grid, start, goal, rng)
-    elif intervention_type == "goal_relocation":
-        return apply_goal_relocation(grid, start, goal, rng)
-    elif intervention_type == "topology_change":
-        return apply_topology_change(grid, start, goal, rng)
-    elif intervention_type == "action_change":
-        return apply_action_change(grid, start, goal, rng)
-    elif intervention_type == "composed":
+    if intervention_type == "composed":
         return apply_composed(grid, start, goal, rng, composed_pair_idx)
-    else:
+    fn = _APPLIERS.get(intervention_type)
+    if fn is None:
         raise ValueError(f"Unknown intervention type: {intervention_type}")
+    return fn(grid, start, goal, rng)

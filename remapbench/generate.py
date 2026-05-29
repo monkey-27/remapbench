@@ -41,7 +41,33 @@ ORACLE_THRESHOLDS = {
 
 SINGLE_INTERVENTIONS = ["sensory_nuisance", "goal_relocation", "topology_change", "action_change"]
 
-# Seed offsets per split — must be spaced > max(n_train, n_val, n_test, n_composed) * max_retries
+# ---------------------------------------------------------------------------
+# Collision-proof split identity scheme
+# ---------------------------------------------------------------------------
+# Each split has a unique integer id. Layout IDs and RNG seeds are derived
+# arithmetically from (seed, split_id, sample_index, attempt) so that:
+#   - layout_id is PROVABLY disjoint across splits (depends on split_id and index
+#     only, NOT on retry attempt).
+#   - layout_seed / intervention_seed are disjoint across splits and across the
+#     layout/intervention roles within a split.
+# This replaces the old additive SEED_OFFSETS scheme, which could in principle
+# collide across splits.
+SPLIT_IDS = {
+    "train_single":  0,
+    "val_single":    1,
+    "test_single":   2,
+    "test_composed": 3,
+    "test_larger":   4,
+    "test_noisy":    5,
+}
+
+LAYOUT_ID_STRIDE = 1_000_000_000   # layout_id = split_id * LAYOUT_ID_STRIDE + index
+SPLIT_SEED_STRIDE = 100_000_000    # per-split seed block
+ROLE_OFFSET = 50_000_000           # layout seeds in [0, ROLE), intervention in [ROLE, 2*ROLE)
+BASE_SEED_STRIDE = 10_000_000_000  # per global-seed block
+
+# DEPRECATED: retained only for backward reference in metadata; no longer used
+# for layout uniqueness (see SPLIT_IDS scheme above).
 SEED_OFFSETS = {
     "train_single":   0,
     "val_single":     500_000,
@@ -58,10 +84,14 @@ SEED_OFFSETS = {
 
 def _generate_one(
     layout_seed, intervention_seed, intervention_type, H, W, gamma, cfg,
-    composed_pair_idx=None, sample_id=0,
+    composed_pair_idx=None, sample_id=0, layout_id=0,
     nuisance_prob=0.15, distractor_prob=0.10,
 ):
-    """Generate one sample with fully deterministic, per-sample seeds."""
+    """Generate one sample with fully deterministic, per-sample seeds.
+
+    layout_id is supplied explicitly (collision-proof per-split scheme) and is
+    independent of the retry attempt encoded in layout_seed.
+    """
     rng_layout = np.random.default_rng(layout_seed)
     rng_inter  = np.random.default_rng(intervention_seed)
 
@@ -73,28 +103,25 @@ def _generate_one(
         distractor_prob=distractor_prob,
     )
 
-    if intervention_type == "composed":
-        result = apply_intervention(grid, start, goal, rng_inter, "composed", composed_pair_idx)
-        g2, g2_goal, iname, multihot, pair, weak = result
-        pair_id = COMPOSED_PAIRS.index(pair) if pair in COMPOSED_PAIRS else -1
-    else:
-        result = apply_intervention(grid, start, goal, rng_inter, intervention_type)
-        g2, g2_goal, iname, multihot, weak = result
-        pair_id = -1
+    result = apply_intervention(grid, start, goal, rng_inter, intervention_type, composed_pair_idx)
+    g2, g2_goal, iname, multihot, weak, extra_meta = result
+    pair = extra_meta.get("composed_pair")
+    pair_id = COMPOSED_PAIRS.index(pair) if pair in COMPOSED_PAIRS else -1
 
     iid = INTERVENTION_IDS.get(iname, INTERVENTION_IDS["composed"])
     sample = build_sample_arrays(
         grid, g2, start, goal, g2_goal,
         iid, multihot, gamma,
-        layout_id=layout_seed,
+        layout_id=layout_id,
         sample_id=sample_id,
         layout_seed=layout_seed,
         intervention_seed=intervention_seed,
         intervention_pair_id=pair_id,
         weak_action_change=weak,
+        action_meta=extra_meta,
     )
 
-    # Post-hoc oracle threshold check
+    # Post-hoc oracle threshold check (minimum signal)
     thresholds = ORACLE_THRESHOLDS.get(intervention_type, {})
     for err_key, min_val in thresholds.items():
         if float(sample[err_key]) < min_val:
@@ -102,32 +129,62 @@ def _generate_one(
                 f"{intervention_type}: {err_key}={float(sample[err_key]):.4f} < {min_val}"
             )
 
+    # Representativeness / behavioral-meaningfulness checks (PART 4 & 5)
+    pa, pb = int(sample["path_len_after"]), int(sample["path_len_before"])
+    abs_path_change = abs(pa - pb) if (pa >= 0 and pb >= 0) else 0
+    fe = float(sample["future_error"])
+    ve = float(sample["value_error"])
+
+    if intervention_type == "action_change":
+        # Reject weak action samples with no behavioral effect.
+        meaningful = (
+            int(weak) == 0 or abs_path_change >= 1 or ve >= 0.02 or fe >= 0.02
+        )
+        if not meaningful:
+            raise ValueError("action_change: not behaviorally meaningful (weak + no effect)")
+
+    if intervention_type == "topology_change":
+        # Reject cosmetic wall perturbations with no structural effect.
+        meaningful = (fe >= 0.02 or abs_path_change >= 1 or ve >= 0.02)
+        if not meaningful:
+            raise ValueError("topology_change: not representative (no future/path/value effect)")
+
     return sample
 
 
 def generate_split(
-    n, intervention_schedule, split_name, seed_offset, H, W, gamma, cfg, verbose=True,
+    n, intervention_schedule, split_name, split_id, base_seed, H, W, gamma, cfg, verbose=True,
     composed_pair_schedule=None, global_id_offset=0,
     nuisance_prob=0.15, distractor_prob=0.10,
 ):
-    """Generate n samples for a split. intervention_schedule is length-n list of type strings."""
+    """Generate n samples for a split using the collision-proof seed scheme.
+
+    layout_id      = split_id * LAYOUT_ID_STRIDE + i        (attempt-independent)
+    layout_seed    = base_seed + split_id*SPLIT_SEED_STRIDE + i*stride + attempt
+    inter_seed     = layout_seed + ROLE_OFFSET
+    where stride = cfg["max_sample_tries"] (so attempts never overlap across i).
+    """
     samples = []
     failures = 0
     t0 = time.time()
+    stride = cfg["max_sample_tries"]
+    split_base = base_seed + split_id * SPLIT_SEED_STRIDE
 
     for i, itype in enumerate(intervention_schedule):
         cidx = (composed_pair_schedule[i] if composed_pair_schedule else None)
         global_sample_id = global_id_offset + i
+        layout_id = split_id * LAYOUT_ID_STRIDE + i  # disjoint across splits, fixed per index
         success = False
 
-        for attempt in range(cfg["max_sample_tries"]):
-            layout_seed = seed_offset + i + attempt * 31337
-            inter_seed  = seed_offset + i + attempt * 17 + 99999
+        for attempt in range(stride):
+            layout_seed = split_base + i * stride + attempt
+            inter_seed  = split_base + ROLE_OFFSET + i * stride + attempt
             try:
                 sample = _generate_one(
                     layout_seed, inter_seed, itype, H, W, gamma, cfg,
                     composed_pair_idx=cidx,
                     sample_id=global_sample_id,
+                    layout_id=layout_id,
                     nuisance_prob=nuisance_prob,
                     distractor_prob=distractor_prob,
                 )
@@ -191,23 +248,28 @@ def generate_dataset(
     os.makedirs(out_dir, exist_ok=True)
     cfg = {**CONFIG, "gamma": gamma}
     master_rng = np.random.default_rng(seed)
+    base_seed = seed * BASE_SEED_STRIDE
     t_start = time.time()
 
     splits = {}
     global_id = 0  # monotonic sample_id counter across splits
 
+    # (name, n, is_composed, H, W, nuisance_prob, distractor_prob)
     spec = [
-        ("train_single",  n_train,   SEED_OFFSETS["train_single"]  + seed * 100, False),
-        ("val_single",    n_val,     SEED_OFFSETS["val_single"]    + seed * 100, False),
-        ("test_single",   n_test,    SEED_OFFSETS["test_single"]   + seed * 100, False),
-        ("test_composed", n_composed,SEED_OFFSETS["test_composed"] + seed * 100, True),
+        ("train_single",  n_train,       False, H,  W,  0.15, 0.10),
+        ("val_single",    n_val,         False, H,  W,  0.15, 0.10),
+        ("test_single",   n_test,        False, H,  W,  0.15, 0.10),
+        ("test_composed", n_composed,    True,  H,  W,  0.15, 0.10),
+        ("test_larger",   n_test_larger, False, 12, 12, 0.15, 0.10),
+        ("test_noisy",    n_test_noisy,  False, H,  W,  0.35, 0.25),
     ]
 
-    for split_name, n, seed_offset, is_composed in spec:
+    for split_name, n, is_composed, Hs, Ws, nz, dz in spec:
         if n <= 0:
             splits[split_name] = []
             continue
-        print(f"Generating {split_name} ({n} samples)...")
+        split_id = SPLIT_IDS[split_name]
+        print(f"Generating {split_name} ({n} samples, grid={Hs}x{Ws}, split_id={split_id})...")
 
         if is_composed:
             n_pairs = len(COMPOSED_PAIRS)
@@ -224,40 +286,13 @@ def generate_dataset(
             pair_sched_raw = None
 
         samples = generate_split(
-            n, itype_sched, split_name, seed_offset, H, W, gamma, cfg, verbose,
+            n, itype_sched, split_name, split_id, base_seed, Hs, Ws, gamma, cfg, verbose,
             composed_pair_schedule=pair_sched_raw,
             global_id_offset=global_id,
+            nuisance_prob=nz, distractor_prob=dz,
         )
         splits[split_name] = samples
         global_id += n
-
-    # test_larger: larger grid (12x12)
-    if n_test_larger > 0:
-        split_name = "test_larger"
-        H_lg, W_lg = 12, 12
-        seed_offset = SEED_OFFSETS["test_larger"] + seed * 100
-        print(f"Generating {split_name} ({n_test_larger} samples, grid={H_lg}x{W_lg})...")
-        itype_sched = _balanced_schedule(n_test_larger, SINGLE_INTERVENTIONS, master_rng)
-        samples = generate_split(
-            n_test_larger, itype_sched, split_name, seed_offset, H_lg, W_lg, gamma, cfg, verbose,
-            global_id_offset=global_id,
-        )
-        splits[split_name] = samples
-        global_id += n_test_larger
-
-    # test_noisy: higher nuisance/distractor density
-    if n_test_noisy > 0:
-        split_name = "test_noisy"
-        seed_offset = SEED_OFFSETS["test_noisy"] + seed * 100
-        print(f"Generating {split_name} ({n_test_noisy} samples, noisy)...")
-        itype_sched = _balanced_schedule(n_test_noisy, SINGLE_INTERVENTIONS, master_rng)
-        samples = generate_split(
-            n_test_noisy, itype_sched, split_name, seed_offset, H, W, gamma, cfg, verbose,
-            global_id_offset=global_id,
-            nuisance_prob=0.35, distractor_prob=0.25,
-        )
-        splits[split_name] = samples
-        global_id += n_test_noisy
 
     # Save
     print("Saving splits...")
@@ -286,11 +321,29 @@ def generate_dataset(
             "action_error":      "fraction of free (action,cell) pairs where transition changed",
         },
         "future_policy": "uniform attempted actions (invalid → stay); not uniform valid actions",
+        "action_change_meta": {
+            "action_cell_row": "row of one-way cell (-1 if not action_change)",
+            "action_cell_col": "col of one-way cell (-1 if not action_change)",
+            "action_cell_on_path": "1 if one-way cell lies on original shortest path",
+            "action_cell_near_path": "1 if within radius-2 of original shortest path",
+            "action_path_action_changed": "1 if one-way dir differs from original path action",
+            "action_path_len_changed": "1 if directed path length changed by >=1",
+        },
         "config": {k: (int(v) if isinstance(v, np.integer) else v) for k, v in cfg.items()},
         "seed": int(seed),
         "grid_H": H, "grid_W": W, "gamma": gamma,
         "split_sizes": {k: len(v) for k, v in splits.items()},
-        "seed_offsets": SEED_OFFSETS,
+        "split_ids": SPLIT_IDS,
+        "layout_id_scheme": (
+            f"layout_id = split_id * {LAYOUT_ID_STRIDE} + sample_index; "
+            "provably disjoint across splits (independent of retry attempt)."
+        ),
+        "seed_scheme": (
+            f"base_seed = seed * {BASE_SEED_STRIDE}; "
+            f"layout_seed = base_seed + split_id*{SPLIT_SEED_STRIDE} + i*max_sample_tries + attempt; "
+            f"intervention_seed = layout_seed + {ROLE_OFFSET}."
+        ),
+        "seed_offsets_DEPRECATED": SEED_OFFSETS,
     }
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)

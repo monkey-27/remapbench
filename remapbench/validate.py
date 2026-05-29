@@ -247,6 +247,16 @@ def validate(data_dir):
                 if weak_rate > WEAK_ACTION_WARN:
                     print(f"    [WARN] weak rate {weak_rate:.2f} > {WEAK_ACTION_WARN} (hard fail at {WEAK_ACTION_FAIL})")
 
+        # Action-change relevance metadata rates (optional fields; skip if absent)
+        ac_mask = iids == 3
+        meta_fields = ["action_cell_on_path", "action_cell_near_path",
+                       "action_path_action_changed", "action_path_len_changed"]
+        if ac_mask.sum() > 0 and all(f in data for f in meta_fields):
+            meta_rates = {f: float(data[f][ac_mask].mean()) for f in meta_fields}
+            diag["action_meta_rates"] = meta_rates
+            print("  action_change relevance rates: " +
+                  "  ".join(f"{f.replace('action_', '')}={v:.3f}" for f, v in meta_rates.items()))
+
         diagnostics[split_name] = diag
 
     diagnostics["all_assertions_passed"] = all_ok

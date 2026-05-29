@@ -103,13 +103,24 @@ def build_sample_arrays(
     intervention_id, target_multihot, gamma=0.95,
     layout_id=0, sample_id=0, layout_seed=0,
     intervention_seed=0, intervention_pair_id=-1,
-    weak_action_change=0,
+    weak_action_change=0, action_meta=None,
 ):
     """
     Assemble all sample fields by running oracles on before/after grids.
     Returns a dict suitable for np.savez_compressed.
     """
     H, W = grid_before.shape[1], grid_before.shape[2]
+
+    # Action-change relevance metadata (defaults for non-action samples)
+    am = {
+        "action_cell_row": -1, "action_cell_col": -1,
+        "action_cell_on_path": 0, "action_cell_near_path": 0,
+        "action_path_action_changed": 0, "action_path_len_changed": 0,
+    }
+    if action_meta:
+        for k in am:
+            if k in action_meta:
+                am[k] = action_meta[k]
 
     T_b = build_transition(grid_before)
     T_a = build_transition(grid_after)
@@ -186,4 +197,11 @@ def build_sample_arrays(
         intervention_seed=np.int64(intervention_seed),
         intervention_pair_id=np.int64(intervention_pair_id),
         weak_action_change=np.int64(weak_action_change),
+        # Action-change relevance metadata
+        action_cell_row=np.int64(am["action_cell_row"]),
+        action_cell_col=np.int64(am["action_cell_col"]),
+        action_cell_on_path=np.uint8(am["action_cell_on_path"]),
+        action_cell_near_path=np.uint8(am["action_cell_near_path"]),
+        action_path_action_changed=np.uint8(am["action_path_action_changed"]),
+        action_path_len_changed=np.uint8(am["action_path_len_changed"]),
     )
