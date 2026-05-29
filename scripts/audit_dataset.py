@@ -46,6 +46,20 @@ ALL_SPLITS = ["train_single", "val_single", "test_single",
 SINGLE_SPLITS = ["train_single", "val_single", "test_single",
                  "test_larger", "test_noisy"]
 
+# Default COMPOSED_PAIRS ordering (mirrors remapbench.interventions.COMPOSED_PAIRS).
+# Used to map intervention_pair_id → component intervention names when metadata.json
+# is unavailable.
+DEFAULT_COMPOSED_PAIRS = [
+    ("goal_relocation",  "topology_change"),   # 0
+    ("sensory_nuisance", "action_change"),     # 1
+    ("goal_relocation",  "action_change"),     # 2
+    ("sensory_nuisance", "topology_change"),   # 3
+]
+
+MIN_SAVED_FRACTION = 0.95   # split-completion hard-fail threshold
+COMPOSED_EVID_MIN  = 0.85   # composed component evidence pass-rate threshold
+ACTION_ERR_MIN     = 0.012  # action_error meaningful threshold
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -116,6 +130,25 @@ def audit(data_dir):
     hard_fails = []   # each entry → blocks pilot
     warnings = []     # informational
 
+    # Load metadata.json if present (for requested split sizes + composed pair map)
+    metadata = None
+    meta_path = os.path.join(data_dir, "metadata.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            metadata = None
+            warnings.append("metadata.json present but could not be parsed")
+
+    # Resolve composed pair map (id -> (compA, compB))
+    composed_pairs = list(DEFAULT_COMPOSED_PAIRS)
+    if metadata and isinstance(metadata.get("composed_pairs"), list) and metadata["composed_pairs"]:
+        try:
+            composed_pairs = [tuple(p) for p in metadata["composed_pairs"]]
+        except TypeError:
+            pass
+
     # =======================================================================
     # 1. Split integrity
     # =======================================================================
@@ -170,6 +203,41 @@ def audit(data_dir):
             warnings.append(f"test_composed: pair imbalance {imb:.2f} > 0.10")
 
     report["1_split_integrity"] = integrity
+
+    # =======================================================================
+    # 1b. Split completion (requested vs actual saved counts)
+    # =======================================================================
+    completion = {}
+    if metadata and isinstance(metadata.get("requested_split_sizes"), dict):
+        req = metadata["requested_split_sizes"]
+        # Was this generated as a tiny smoke set? (train_single requested < 400)
+        smoke_sized = int(req.get("train_single", 0)) < 400
+        for split_name, requested_n in req.items():
+            requested_n = int(requested_n)
+            if requested_n <= 0:
+                continue
+            actual_n = (len(splits[split_name]["intervention_id"])
+                        if split_name in splits else 0)
+            frac = actual_n / requested_n
+            completion[split_name] = {
+                "requested": requested_n,
+                "actual": int(actual_n),
+                "saved_fraction": float(frac),
+            }
+            if actual_n == 0:
+                hard_fails.append(
+                    f"{split_name}: requested {requested_n} samples but 0 saved "
+                    "(generation produced nothing)")
+            elif frac < MIN_SAVED_FRACTION:
+                hard_fails.append(
+                    f"{split_name}: only {actual_n}/{requested_n} saved "
+                    f"(fraction {frac:.2f} < {MIN_SAVED_FRACTION})"
+                    + (" [smoke-sized: see note]" if smoke_sized else ""))
+        completion["_smoke_sized"] = bool(smoke_sized)
+    else:
+        warnings.append("metadata.json missing or has no requested_split_sizes; "
+                        "cannot verify requested split completion")
+    report["1b_split_completion"] = completion
 
     # =======================================================================
     # NaN / Inf check (hard fail)
@@ -444,6 +512,184 @@ def audit(data_dir):
             hard_fails.append(f"test_composed: {n_bad} samples with <2 active labels")
 
     # =======================================================================
+    # 6. Composed intervention evidence audit
+    # =======================================================================
+    # For each composed sample, verify scalar evidence supports each active
+    # component intervention (not just that target_multihot has >=2 labels).
+    composed_evidence = {}
+    if "test_composed" in splits:
+        d = splits["test_composed"]
+        n = len(d["intervention_id"])
+        ne = _get(d, "nuisance_error", n)
+        fe = _get(d, "future_error", n)
+        ve = _get(d, "value_error", n)
+        ae = _get(d, "action_error", n)
+        apc = _abs_path_change(d)
+        weak = _get(d, "weak_action_change", n)
+        on_path = _get(d, "action_cell_on_path", n)
+
+        def _component_evidence(comp):
+            """Boolean array [n]: does scalar evidence support `comp`?"""
+            if comp == "sensory_nuisance":
+                return ne >= SIGNAL
+            if comp == "goal_relocation":
+                return ve >= SIGNAL
+            if comp == "topology_change":
+                return (fe >= SIGNAL) | (apc >= 1) | (ve >= SIGNAL)
+            if comp == "action_change":
+                return (ae >= ACTION_ERR_MIN) & (
+                    (weak == 0) | (apc >= 1) | (fe >= SIGNAL) |
+                    (ve >= SIGNAL) | (on_path >= 0.5))
+            return np.zeros(n, dtype=bool)
+
+        pid = d["intervention_pair_id"] if "intervention_pair_id" in d else None
+        if pid is not None:
+            uniq = sorted(set(int(x) for x in pid.tolist() if int(x) >= 0))
+        else:
+            uniq = []
+
+        if not uniq:
+            # No pair ids — cannot attribute evidence to components.
+            warnings.append("test_composed: intervention_pair_id absent; "
+                            "cannot run composed component-evidence audit")
+        for u in uniq:
+            if u >= len(composed_pairs):
+                warnings.append(f"test_composed: pair_id {u} out of range of "
+                                f"known composed_pairs ({len(composed_pairs)})")
+                continue
+            compA, compB = composed_pairs[u][0], composed_pairs[u][1]
+            mask = (pid == u)
+            cnt = int(mask.sum())
+            if cnt == 0:
+                continue
+            evidA = _component_evidence(compA)[mask]
+            evidB = _component_evidence(compB)[mask]
+            both = evidA & evidB
+            entry = {
+                "pair": [compA, compB],
+                "n": cnt,
+                "component_pass_rates": {
+                    compA: float(evidA.mean()),
+                    compB: float(evidB.mean()),
+                },
+                "all_components_pass_rate": float(both.mean()),
+                "mean_scalar_errors": {
+                    "nuisance_error": float(ne[mask].mean()),
+                    "future_error": float(fe[mask].mean()),
+                    "value_error": float(ve[mask].mean()),
+                    "action_error": float(ae[mask].mean()),
+                    "abs_path_len_change": float(apc[mask].mean()),
+                },
+            }
+            if "action_change" in (compA, compB):
+                entry["weak_action_change_rate"] = float(weak[mask].mean())
+            composed_evidence[f"pair_{u}"] = entry
+
+            # Hard-fail rules
+            if entry["all_components_pass_rate"] < COMPOSED_EVID_MIN:
+                hard_fails.append(
+                    f"test_composed[{compA}+{compB}]: all-components evidence rate "
+                    f"{entry['all_components_pass_rate']:.2f} < {COMPOSED_EVID_MIN}")
+            for comp, rate in entry["component_pass_rates"].items():
+                if rate < COMPOSED_EVID_MIN:
+                    hard_fails.append(
+                        f"test_composed[{compA}+{compB}]: component '{comp}' evidence "
+                        f"rate {rate:.2f} < {COMPOSED_EVID_MIN}")
+    report["6_composed_evidence"] = composed_evidence
+
+    # =======================================================================
+    # 7. Action metadata consistency
+    # =======================================================================
+    action_meta = {}
+
+    # 7a. Single splits
+    for nm in SINGLE_SPLITS:
+        if nm not in splits:
+            continue
+        d = splits[nm]
+        n = len(d["intervention_id"])
+        iids = d["intervention_id"]
+        if "action_cell_row" not in d:
+            continue
+        row = d["action_cell_row"].astype(np.int64)
+        col = d["action_cell_col"].astype(np.int64)
+        ae = _get(d, "action_error", n)
+        weak = _get(d, "weak_action_change", n)
+        on_path = _get(d, "action_cell_on_path", n)
+        near_path = _get(d, "action_cell_near_path", n)
+        apc_present = _get(d, "action_path_action_changed", n)
+        plc = _get(d, "action_path_len_changed", n)
+        ent = {}
+
+        amask = iids == 3  # action_change
+        if amask.sum() > 0:
+            na = int(amask.sum())
+            missing_cell = ((row[amask] < 0) | (col[amask] < 0))
+            frac_missing = float(missing_cell.mean())
+            # at least one of on/near path should be 1 unless weak
+            wk = weak[amask]
+            located = (on_path[amask] >= 0.5) | (near_path[amask] >= 0.5)
+            frac_unlocated_strong = float(((wk == 0) & ~located).mean())
+            frac_action_err_low = float((ae[amask] <= ACTION_ERR_MIN).mean())
+            ent["action_change"] = {
+                "n": na,
+                "frac_missing_cell": frac_missing,
+                "frac_strong_but_unlocated": frac_unlocated_strong,
+                "frac_action_error_below_min": frac_action_err_low,
+            }
+            if frac_missing > 0.02:
+                hard_fails.append(
+                    f"{nm}: {frac_missing:.2f} of action_change samples missing "
+                    "action cell metadata (>0.02)")
+
+        # non-action single classes must have default (cleared) metadata
+        nmask = np.isin(iids, [0, 1, 2])
+        if nmask.sum() > 0:
+            nn = int(nmask.sum())
+            cell_set = ((row[nmask] >= 0) | (col[nmask] >= 0))
+            bools_set = ((on_path[nmask] >= 0.5) | (near_path[nmask] >= 0.5) |
+                         (apc_present[nmask] >= 0.5) | (plc[nmask] >= 0.5))
+            frac_leak = float((cell_set | bools_set).mean())
+            ent["non_action"] = {"n": nn, "frac_metadata_set": frac_leak}
+            if frac_leak > 0.0:
+                hard_fails.append(
+                    f"{nm}: {frac_leak:.3f} of non-action single samples have "
+                    "action metadata set (>0)")
+        action_meta[nm] = ent
+
+    # 7b. Composed splits with an action component
+    if "test_composed" in splits and "action_cell_row" in splits["test_composed"]:
+        d = splits["test_composed"]
+        n = len(d["intervention_id"])
+        row = d["action_cell_row"].astype(np.int64)
+        col = d["action_cell_col"].astype(np.int64)
+        ae = _get(d, "action_error", n)
+        pid = d["intervention_pair_id"] if "intervention_pair_id" in d else None
+        if pid is not None:
+            action_pair_ids = [u for u in range(len(composed_pairs))
+                               if "action_change" in composed_pairs[u]]
+            amask = np.isin(pid, action_pair_ids)
+            if amask.sum() > 0:
+                na = int(amask.sum())
+                missing_cell = ((row[amask] < 0) | (col[amask] < 0))
+                frac_missing = float(missing_cell.mean())
+                frac_action_err_ok = float((ae[amask] > ACTION_ERR_MIN).mean())
+                action_meta["test_composed"] = {
+                    "n_action_composed": na,
+                    "frac_missing_cell": frac_missing,
+                    "frac_action_error_above_min": frac_action_err_ok,
+                }
+                if frac_missing > 0.15:
+                    hard_fails.append(
+                        f"test_composed: {frac_missing:.2f} of action-composed "
+                        "samples missing action cell metadata (>0.15)")
+                if frac_action_err_ok < COMPOSED_EVID_MIN:
+                    warnings.append(
+                        f"test_composed: only {frac_action_err_ok:.2f} of "
+                        f"action-composed samples have action_error>{ACTION_ERR_MIN}")
+    report["7_action_metadata_consistency"] = action_meta
+
+    # =======================================================================
     # 6. Pilot readiness decision
     # =======================================================================
     pilot_ready = len(hard_fails) == 0
@@ -464,6 +710,23 @@ def _print_summary(report):
     print("DATASET AUDIT SUMMARY")
     print("=" * 64)
     print(f"splits present: {report['splits_present']}")
+
+    comp = report.get("1b_split_completion", {})
+    if comp:
+        print("\nsplit completion (requested -> actual saved):")
+        for k, v in comp.items():
+            if k.startswith("_"):
+                continue
+            print(f"  {k:15s} {v['actual']:>6d}/{v['requested']:<6d} "
+                  f"(fraction {v['saved_fraction']:.3f})")
+
+    ce = report.get("6_composed_evidence", {})
+    if ce:
+        print("\ncomposed component evidence (all-components pass rate):")
+        for k, v in ce.items():
+            pair = "+".join(v["pair"])
+            print(f"  {pair:38s} all={v['all_components_pass_rate']:.3f} "
+                  f"(n={v['n']})")
 
     sep = report.get("3_separability", {})
     if "train_self_accuracy" in sep:
@@ -494,6 +757,16 @@ def _print_summary(report):
         print("\nHARD FAILS (block pilot):")
         for f in report["hard_fails"]:
             print(f"  - {f}")
+
+    # Split-completion smoke caveat
+    comp = report.get("1b_split_completion", {})
+    completion_fail = any(
+        ("only" in f or "0 saved" in f) and "saved" in f
+        for f in report["hard_fails"])
+    if comp.get("_smoke_sized") and completion_fail:
+        print("\nNOTE (split completion): one or more splits saved < 95% of requested "
+              "samples. This may be due to tiny smoke size, but full pilot must pass "
+              "this rule.")
 
     if report.get("small_dataset_note"):
         print("\nNOTE: train_single < 400 samples — this looks like a smoke/preflight set. "

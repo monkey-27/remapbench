@@ -80,19 +80,36 @@ python scripts/check_gates.py    --config configs/smoke.yaml \
 python scripts/make_plots.py     --config configs/smoke.yaml --run_dir results/smoke_gated_erpm
 ```
 
-`validate` checks array well-formedness and broad per-sample thresholds.
-`audit_dataset` is a **stricter scientific-validity gate** — it must report
-`PILOT READY: YES` before launching a full pilot (run with `--strict` to make a
-failing audit exit nonzero). It checks split integrity (provably-disjoint layout
-IDs, unique sample IDs, class balance), per-class signal strength, scalar-error
-separability (nearest-centroid sanity check), behavioral meaningfulness of
-topology/action changes, and channel-leakage artifacts.
+`validate.py` checks **structural correctness** — array well-formedness, broad
+per-sample thresholds, NaN/Inf, layout-ID disjointness, and now prints
+requested-vs-actual split sizes and composed pair counts.
+
+`audit_dataset.py` checks **scientific representativeness** and is the strict
+gate: a full pilot training run **must not start unless it reports
+`PILOT READY: YES`** (run with `--strict` to make a failing audit exit nonzero).
+It checks:
+- **split completion** (requested vs actual saved counts; hard-fails if a split
+  saved < 95% of requested samples — catches silent over-rejection in generation),
+- **layout/sample leakage** (provably-disjoint layout IDs, unique sample IDs),
+- **class balance** across interventions,
+- **scalar signal profiles** per class (nearest-centroid separability sanity check),
+- **topology/action meaningfulness** (behavioral effect, not cosmetic edits),
+- **composed evidence** (each active component of a composed sample must be
+  supported by its scalar errors, not just present in `target_multihot`),
+- **action-metadata consistency** (one-way cell located for action samples,
+  cleared for non-action samples),
+- **channel / artifact leakage** (forbidden channels must not change per type).
 
 ### Pilot commands *(longer run; do not run by default)*
+
+Before any full pilot run, generate, validate, and pass the strict audit:
 
 ```bash
 python scripts/generate_data.py  --config configs/pilot.yaml
 python -m remapbench.validate    --data_dir data/remapbench_v0
+python scripts/audit_dataset.py  --data_dir data/remapbench_v0 \
+    --out data/remapbench_v0/audit_report.json --strict
+# Only proceed to training if the audit prints PILOT READY: YES
 python scripts/train.py          --config configs/pilot.yaml
 python scripts/evaluate.py       --config configs/pilot.yaml \
     --checkpoint results/pilot_gated_erpm_seed0/best.pt --split test_single --gate_ablations

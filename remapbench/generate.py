@@ -149,6 +149,30 @@ def _generate_one(
         if not meaningful:
             raise ValueError("topology_change: not representative (no future/path/value effect)")
 
+    if intervention_type == "composed":
+        # Each ACTIVE component of a composed sample must be supported by scalar
+        # evidence at the COMBINED-sample level — not merely present in the
+        # multihot label. These rules mirror audit_dataset.py's composed-evidence
+        # audit exactly, so a dataset that generates cleanly also passes the audit.
+        ne = float(sample["nuisance_error"])
+        ae = float(sample["action_error"])
+        on_path = int(sample["action_cell_on_path"])
+        mh = list(multihot)
+        # mh = [sensory_update, value_remap, map_remap, action_remap]
+        if mh[0] and not (ne >= 0.02):
+            raise ValueError("composed: sensory component lacks nuisance signal")
+        if mh[1] and not (ve >= 0.02):
+            raise ValueError("composed: value component lacks value signal")
+        if mh[2] and not (fe >= 0.02 or abs_path_change >= 1 or ve >= 0.02):
+            raise ValueError("composed: topology component lacks structural effect")
+        if mh[3]:
+            action_ok = (ae >= 0.012) and (
+                int(weak) == 0 or abs_path_change >= 1 or fe >= 0.02
+                or ve >= 0.02 or on_path == 1
+            )
+            if not action_ok:
+                raise ValueError("composed: action component lacks transition effect")
+
     return sample
 
 
@@ -333,6 +357,15 @@ def generate_dataset(
         "seed": int(seed),
         "grid_H": H, "grid_W": W, "gamma": gamma,
         "split_sizes": {k: len(v) for k, v in splits.items()},
+        "requested_split_sizes": {
+            "train_single":  int(n_train),
+            "val_single":    int(n_val),
+            "test_single":   int(n_test),
+            "test_composed": int(n_composed),
+            "test_larger":   int(n_test_larger),
+            "test_noisy":    int(n_test_noisy),
+        },
+        "min_saved_fraction_recommended": 0.95,
         "split_ids": SPLIT_IDS,
         "layout_id_scheme": (
             f"layout_id = split_id * {LAYOUT_ID_STRIDE} + sample_index; "

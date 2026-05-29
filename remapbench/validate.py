@@ -105,6 +105,28 @@ def validate(data_dir):
     all_ok = True
 
     # -----------------------------------------------------------------------
+    # Requested vs actual split sizes (from metadata.json, if present)
+    # -----------------------------------------------------------------------
+    meta_path = os.path.join(data_dir, "metadata.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            meta = None
+        if meta and isinstance(meta.get("requested_split_sizes"), dict):
+            print("\n--- Requested vs actual split sizes ---")
+            req = meta["requested_split_sizes"]
+            for name, requested_n in req.items():
+                requested_n = int(requested_n)
+                if requested_n <= 0:
+                    continue
+                actual_n = len(splits[name]["intervention_id"]) if name in splits else 0
+                frac = actual_n / requested_n if requested_n else float("nan")
+                print(f"  {name:15s} {actual_n:>6d}/{requested_n:<6d} (fraction {frac:.3f})")
+            print("  (audit_dataset.py is the strict gate that hard-fails on low completion)")
+
+    # -----------------------------------------------------------------------
     # NaN / Inf check
     # -----------------------------------------------------------------------
     print("\n--- NaN/Inf checks ---")
@@ -177,6 +199,15 @@ def validate(data_dir):
             cnt = int(mh[:, i].sum())
             diag["target_label_counts"][lname] = cnt
         print(f"  label counts: {diag['target_label_counts']}")
+
+        # Composed pair counts (structural view only; audit checks evidence)
+        if "intervention_pair_id" in data:
+            pid = data["intervention_pair_id"]
+            uniq = sorted(set(int(x) for x in pid.tolist() if int(x) >= 0))
+            if uniq:
+                pair_counts = {int(u): int((pid == u).sum()) for u in uniq}
+                diag["composed_pair_counts"] = pair_counts
+                print(f"  composed pair counts: {pair_counts}")
 
         is_single   = "single" in split_name or split_name in ("test_larger", "test_noisy")
         is_composed = "composed" in split_name
