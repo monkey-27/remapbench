@@ -24,6 +24,7 @@ THRESH_NEAR_ZERO  = 0.015
 MIN_PASS_RATE     = 0.90
 WEAK_ACTION_WARN  = 0.10   # warn if weak rate exceeds this
 WEAK_ACTION_FAIL  = 0.25   # hard fail if weak rate exceeds this
+ACTION_LOCAL_MIN  = 0.20
 
 
 def load_split(path):
@@ -54,6 +55,11 @@ def _check_sample_topology(s):
 
 
 def _check_sample_action(s):
+    if all(k in s for k in ("action_changed_count", "action_changed_cell_count",
+                            "action_error_local")):
+        return (int(s["action_changed_count"]) >= 1 and
+                int(s["action_changed_cell_count"]) >= 1 and
+                float(s["action_error_local"]) >= ACTION_LOCAL_MIN)
     return float(s["action_error"]) > THRESH_HIGH
 
 
@@ -287,6 +293,14 @@ def validate(data_dir):
             diag["action_meta_rates"] = meta_rates
             print("  action_change relevance rates: " +
                   "  ".join(f"{f.replace('action_', '')}={v:.3f}" for f, v in meta_rates.items()))
+
+        local_action_fields = ["action_changed_count", "action_changed_cell_count",
+                               "action_error_local"]
+        if ac_mask.sum() > 0 and all(f in data for f in local_action_fields):
+            local_stats = {f: float(data[f][ac_mask].mean()) for f in local_action_fields}
+            diag["action_local_signal_stats"] = local_stats
+            print("  action_change local signal: " +
+                  "  ".join(f"mean_{f}={v:.3f}" for f, v in local_stats.items()))
 
         diagnostics[split_name] = diag
 

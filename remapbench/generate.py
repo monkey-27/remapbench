@@ -36,8 +36,9 @@ ORACLE_THRESHOLDS = {
     "sensory_nuisance": {"nuisance_error": 0.02},
     "goal_relocation":  {"value_error": 0.02},
     "topology_change":  {"future_error": 0.012},   # > validate THRESH_HIGH=0.01
-    "action_change":    {"action_error": 0.012},   # > validate THRESH_HIGH=0.01
 }
+
+ACTION_LOCAL_MIN = 0.20
 
 SINGLE_INTERVENTIONS = ["sensory_nuisance", "goal_relocation", "topology_change", "action_change"]
 
@@ -135,13 +136,28 @@ def _generate_one(
     fe = float(sample["future_error"])
     ve = float(sample["value_error"])
 
-    if intervention_type == "action_change":
-        # Reject weak action samples with no behavioral effect.
+    def _action_component_ok():
+        changed_count = int(sample["action_changed_count"])
+        changed_cell_count = int(sample["action_changed_cell_count"])
+        action_local = float(sample["action_error_local"])
+        on_path = int(sample["action_cell_on_path"])
         meaningful = (
-            int(weak) == 0 or abs_path_change >= 1 or ve >= 0.02 or fe >= 0.02
+            int(weak) == 0 or abs_path_change >= 1 or ve >= 0.02 or
+            fe >= 0.02 or on_path == 1
         )
+        return (
+            changed_count >= 1 and
+            changed_cell_count >= 1 and
+            action_local >= ACTION_LOCAL_MIN and
+            meaningful
+        )
+
+    if intervention_type == "action_change":
+        # Reject weak/off-path action samples with no transition-local evidence.
+        meaningful = _action_component_ok()
         if not meaningful:
-            raise ValueError("action_change: not behaviorally meaningful (weak + no effect)")
+            raise ValueError(
+                "action_change: insufficient scale-invariant transition evidence")
 
     if intervention_type == "topology_change":
         # Reject cosmetic wall perturbations with no structural effect.
@@ -155,8 +171,6 @@ def _generate_one(
         # multihot label. These rules mirror audit_dataset.py's composed-evidence
         # audit exactly, so a dataset that generates cleanly also passes the audit.
         ne = float(sample["nuisance_error"])
-        ae = float(sample["action_error"])
-        on_path = int(sample["action_cell_on_path"])
         mh = list(multihot)
         # mh = [sensory_update, value_remap, map_remap, action_remap]
         if mh[0] and not (ne >= 0.02):
@@ -166,10 +180,7 @@ def _generate_one(
         if mh[2] and not (fe >= 0.02 or abs_path_change >= 1 or ve >= 0.02):
             raise ValueError("composed: topology component lacks structural effect")
         if mh[3]:
-            action_ok = (ae >= 0.012) and (
-                int(weak) == 0 or abs_path_change >= 1 or fe >= 0.02
-                or ve >= 0.02 or on_path == 1
-            )
+            action_ok = _action_component_ok()
             if not action_ok:
                 raise ValueError("composed: action component lacks transition effect")
 
@@ -343,6 +354,9 @@ def generate_dataset(
             "future_error":      "mean |delta_future|",
             "value_error":       "mean |delta_value|",
             "action_error":      "fraction of free (action,cell) pairs where transition changed",
+            "action_changed_count": "count of changed free action transitions",
+            "action_changed_cell_count": "count of free cells with at least one changed action transition",
+            "action_error_local": "changed transitions divided by possible actions at changed cells",
         },
         "future_policy": "uniform attempted actions (invalid → stay); not uniform valid actions",
         "action_change_meta": {

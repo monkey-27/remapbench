@@ -58,7 +58,8 @@ DEFAULT_COMPOSED_PAIRS = [
 
 MIN_SAVED_FRACTION = 0.95   # split-completion hard-fail threshold
 COMPOSED_EVID_MIN  = 0.85   # composed component evidence pass-rate threshold
-ACTION_ERR_MIN     = 0.012  # action_error meaningful threshold
+ACTION_ERR_MIN     = 0.012  # legacy global action_error reporting threshold
+ACTION_LOCAL_MIN   = 0.20   # local transition-change density threshold
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +375,9 @@ def audit(data_dir):
         if amask.sum() > 0:
             weak = _get(d, "weak_action_change", n)[amask]
             on_path = _get(d, "action_cell_on_path", n)[amask]
+            changed_count = _get(d, "action_changed_count", n)[amask]
+            changed_cell_count = _get(d, "action_changed_cell_count", n)[amask]
+            action_local = _get(d, "action_error_local", n)[amask]
             b["action"] = {
                 "n": int(amask.sum()),
                 "weak_rate": float(weak.mean()),
@@ -381,20 +385,31 @@ def audit(data_dir):
                 "frac_future_signal": float((fe[amask] >= SIGNAL).mean()),
                 "frac_value_signal": float((ve[amask] >= SIGNAL).mean()),
                 "frac_on_path": float(on_path.mean()),
+                "mean_action_changed_count": float(changed_count.mean()),
+                "mean_action_changed_cell_count": float(changed_cell_count.mean()),
+                "mean_action_error_local": float(action_local.mean()),
+                "frac_action_changed_count_zero": float((changed_count < 1).mean()),
+                "frac_action_changed_cell_count_zero": float((changed_cell_count < 1).mean()),
+                "frac_action_error_local_below_min": float((action_local < ACTION_LOCAL_MIN).mean()),
             }
-            meaningful = ((apc[amask] >= 1) | (fe[amask] >= SIGNAL) |
-                          (ve[amask] >= SIGNAL) | (on_path >= 0.5))
+            meaningful = (
+                (changed_count >= 1) & (
+                    (weak == 0) | (apc[amask] >= 1) | (fe[amask] >= SIGNAL) |
+                    (ve[amask] >= SIGNAL) | (on_path >= 0.5)
+                )
+            )
             b["action"]["frac_meaningful"] = float(meaningful.mean())
         behavior[nm] = b
 
     report["4_behavioral_meaningfulness"] = behavior
 
-    # Hard-fail rules on train/test single splits
-    for nm in ["train_single", "test_single"]:
+    # Hard-fail rules on single splits. Topology is gated on train/test single,
+    # while action evidence is checked anywhere action_change appears.
+    for nm in SINGLE_SPLITS:
         if nm not in behavior:
             continue
         bt = behavior[nm].get("topology")
-        if bt and bt["frac_meaningful"] < 0.70:
+        if nm in ["train_single", "test_single"] and bt and bt["frac_meaningful"] < 0.70:
             hard_fails.append(f"{nm}: topology meaningful fraction "
                               f"{bt['frac_meaningful']:.2f} < 0.70")
         ba = behavior[nm].get("action")
@@ -405,6 +420,18 @@ def audit(data_dir):
             if ba["frac_meaningful"] < 0.50:
                 hard_fails.append(f"{nm}: action meaningful fraction "
                                   f"{ba['frac_meaningful']:.2f} < 0.50")
+            if ba["frac_action_changed_count_zero"] > 0.02:
+                hard_fails.append(
+                    f"{nm}: action_changed_count < 1 in "
+                    f"{ba['frac_action_changed_count_zero']:.2f} of action samples (>0.02)")
+            if ba["frac_action_changed_cell_count_zero"] > 0.02:
+                hard_fails.append(
+                    f"{nm}: action_changed_cell_count < 1 in "
+                    f"{ba['frac_action_changed_cell_count_zero']:.2f} of action samples (>0.02)")
+            if ba["frac_action_error_local_below_min"] > 0.02:
+                hard_fails.append(
+                    f"{nm}: action_error_local < {ACTION_LOCAL_MIN} in "
+                    f"{ba['frac_action_error_local_below_min']:.2f} of action samples (>0.02)")
 
     # =======================================================================
     # 5. Artifact checks (channel leakage on single classes)
@@ -527,6 +554,8 @@ def audit(data_dir):
         apc = _abs_path_change(d)
         weak = _get(d, "weak_action_change", n)
         on_path = _get(d, "action_cell_on_path", n)
+        changed_count = _get(d, "action_changed_count", n)
+        action_local = _get(d, "action_error_local", n)
 
         def _component_evidence(comp):
             """Boolean array [n]: does scalar evidence support `comp`?"""
@@ -537,7 +566,7 @@ def audit(data_dir):
             if comp == "topology_change":
                 return (fe >= SIGNAL) | (apc >= 1) | (ve >= SIGNAL)
             if comp == "action_change":
-                return (ae >= ACTION_ERR_MIN) & (
+                return (changed_count >= 1) & (action_local >= ACTION_LOCAL_MIN) & (
                     (weak == 0) | (apc >= 1) | (fe >= SIGNAL) |
                     (ve >= SIGNAL) | (on_path >= 0.5))
             return np.zeros(n, dtype=bool)
@@ -578,6 +607,8 @@ def audit(data_dir):
                     "future_error": float(fe[mask].mean()),
                     "value_error": float(ve[mask].mean()),
                     "action_error": float(ae[mask].mean()),
+                    "action_changed_count": float(changed_count[mask].mean()),
+                    "action_error_local": float(action_local[mask].mean()),
                     "abs_path_len_change": float(apc[mask].mean()),
                 },
             }
@@ -614,6 +645,9 @@ def audit(data_dir):
         row = d["action_cell_row"].astype(np.int64)
         col = d["action_cell_col"].astype(np.int64)
         ae = _get(d, "action_error", n)
+        changed_count = _get(d, "action_changed_count", n)
+        changed_cell_count = _get(d, "action_changed_cell_count", n)
+        action_local = _get(d, "action_error_local", n)
         weak = _get(d, "weak_action_change", n)
         on_path = _get(d, "action_cell_on_path", n)
         near_path = _get(d, "action_cell_near_path", n)
@@ -631,16 +665,34 @@ def audit(data_dir):
             located = (on_path[amask] >= 0.5) | (near_path[amask] >= 0.5)
             frac_unlocated_strong = float(((wk == 0) & ~located).mean())
             frac_action_err_low = float((ae[amask] <= ACTION_ERR_MIN).mean())
+            frac_changed_count_zero = float((changed_count[amask] < 1).mean())
+            frac_changed_cell_count_zero = float((changed_cell_count[amask] < 1).mean())
+            frac_action_local_low = float((action_local[amask] < ACTION_LOCAL_MIN).mean())
             ent["action_change"] = {
                 "n": na,
                 "frac_missing_cell": frac_missing,
                 "frac_strong_but_unlocated": frac_unlocated_strong,
                 "frac_action_error_below_min": frac_action_err_low,
+                "frac_action_changed_count_zero": frac_changed_count_zero,
+                "frac_action_changed_cell_count_zero": frac_changed_cell_count_zero,
+                "frac_action_error_local_below_min": frac_action_local_low,
             }
             if frac_missing > 0.02:
                 hard_fails.append(
                     f"{nm}: {frac_missing:.2f} of action_change samples missing "
                     "action cell metadata (>0.02)")
+            if frac_changed_count_zero > 0.02:
+                hard_fails.append(
+                    f"{nm}: {frac_changed_count_zero:.2f} of action_change samples have "
+                    "action_changed_count < 1 (>0.02)")
+            if frac_changed_cell_count_zero > 0.02:
+                hard_fails.append(
+                    f"{nm}: {frac_changed_cell_count_zero:.2f} of action_change samples have "
+                    "action_changed_cell_count < 1 (>0.02)")
+            if frac_action_local_low > 0.02:
+                hard_fails.append(
+                    f"{nm}: {frac_action_local_low:.2f} of action_change samples have "
+                    f"action_error_local < {ACTION_LOCAL_MIN} (>0.02)")
 
         # non-action single classes must have default (cleared) metadata
         nmask = np.isin(iids, [0, 1, 2])
@@ -650,7 +702,10 @@ def audit(data_dir):
             bools_set = ((on_path[nmask] >= 0.5) | (near_path[nmask] >= 0.5) |
                          (apc_present[nmask] >= 0.5) | (plc[nmask] >= 0.5))
             frac_leak = float((cell_set | bools_set).mean())
-            ent["non_action"] = {"n": nn, "frac_metadata_set": frac_leak}
+            ent["non_action"] = {
+                "n": nn,
+                "frac_metadata_set": frac_leak,
+            }
             if frac_leak > 0.0:
                 hard_fails.append(
                     f"{nm}: {frac_leak:.3f} of non-action single samples have "
@@ -663,7 +718,8 @@ def audit(data_dir):
         n = len(d["intervention_id"])
         row = d["action_cell_row"].astype(np.int64)
         col = d["action_cell_col"].astype(np.int64)
-        ae = _get(d, "action_error", n)
+        changed_count = _get(d, "action_changed_count", n)
+        action_local = _get(d, "action_error_local", n)
         pid = d["intervention_pair_id"] if "intervention_pair_id" in d else None
         if pid is not None:
             action_pair_ids = [u for u in range(len(composed_pairs))
@@ -673,20 +729,26 @@ def audit(data_dir):
                 na = int(amask.sum())
                 missing_cell = ((row[amask] < 0) | (col[amask] < 0))
                 frac_missing = float(missing_cell.mean())
-                frac_action_err_ok = float((ae[amask] > ACTION_ERR_MIN).mean())
+                frac_changed_ok = float((changed_count[amask] >= 1).mean())
+                frac_action_local_ok = float((action_local[amask] >= ACTION_LOCAL_MIN).mean())
                 action_meta["test_composed"] = {
                     "n_action_composed": na,
                     "frac_missing_cell": frac_missing,
-                    "frac_action_error_above_min": frac_action_err_ok,
+                    "frac_action_changed_count_above_min": frac_changed_ok,
+                    "frac_action_error_local_above_min": frac_action_local_ok,
                 }
                 if frac_missing > 0.15:
                     hard_fails.append(
                         f"test_composed: {frac_missing:.2f} of action-composed "
                         "samples missing action cell metadata (>0.15)")
-                if frac_action_err_ok < COMPOSED_EVID_MIN:
-                    warnings.append(
-                        f"test_composed: only {frac_action_err_ok:.2f} of "
-                        f"action-composed samples have action_error>{ACTION_ERR_MIN}")
+                if frac_changed_ok < COMPOSED_EVID_MIN:
+                    hard_fails.append(
+                        f"test_composed: only {frac_changed_ok:.2f} of "
+                        "action-composed samples have action_changed_count >= 1")
+                if frac_action_local_ok < COMPOSED_EVID_MIN:
+                    hard_fails.append(
+                        f"test_composed: only {frac_action_local_ok:.2f} of "
+                        f"action-composed samples have action_error_local >= {ACTION_LOCAL_MIN}")
     report["7_action_metadata_consistency"] = action_meta
 
     # =======================================================================

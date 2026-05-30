@@ -154,11 +154,20 @@ def build_sample_arrays(
     future_err = float(np.abs(future_a - future_b).mean())
     value_err  = float(np.abs(value_a  - value_b).mean())
 
-    # action_error: fraction of free-cell × action pairs that changed
+    # action_error: fraction of free-cell x action pairs that changed. This is
+    # retained for compatibility but is diluted on larger grids.
     free_mask = (grid_before[CH_WALL].flatten() == 0).astype(np.float32)
     n_free = free_mask.sum()
+    changed = act_delta.reshape(4, -1) * free_mask[None, :]
+    action_changed_count = int(changed.sum())
+    changed_per_cell = changed.sum(axis=0)
+    action_changed_cell_count = int((changed_per_cell > 0).sum())
+    if action_changed_cell_count > 0:
+        action_error_local = action_changed_count / (4.0 * action_changed_cell_count)
+    else:
+        action_error_local = 0.0
     action_err = float(
-        (act_delta.reshape(4, -1) * free_mask[None, :]).sum() / (4.0 * n_free + 1e-8)
+        action_changed_count / (4.0 * n_free + 1e-8)
     )
 
     return dict(
@@ -187,6 +196,9 @@ def build_sample_arrays(
         future_error=np.float32(future_err),
         value_error=np.float32(value_err),
         action_error=np.float32(action_err),
+        action_changed_count=np.int64(action_changed_count),
+        action_changed_cell_count=np.int64(action_changed_cell_count),
+        action_error_local=np.float32(action_error_local),
         # Path lengths
         path_len_before=np.int64(path_b),
         path_len_after=np.int64(path_a),

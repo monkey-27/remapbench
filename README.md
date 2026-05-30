@@ -230,8 +230,14 @@ Reverse BFS from goal under directed transitions.
 | `future_error` | Mean `|delta_future|` |
 | `value_error` | Mean `|delta_value|` |
 | `action_error` | Fraction of free (action, cell) pairs where transition changed |
+| `action_changed_count` | Count of changed free action transitions |
+| `action_changed_cell_count` | Count of free cells with at least one changed action transition |
+| `action_error_local` | Changed transitions divided by possible actions at changed cells |
 
-`action_error` uses free (non-wall) cells only to avoid dilution by wall fraction.
+`action_error` uses free (non-wall) cells only to avoid dilution by wall fraction,
+but it is still grid-size dependent because the denominator grows with all free
+cells. Scale-invariant action validity is based on `action_changed_count`,
+`action_changed_cell_count`, and `action_error_local`.
 
 ---
 
@@ -248,6 +254,8 @@ Reverse BFS from goal under directed transitions.
 | `action_delta` | float32 | [4,H,W] |
 | `nuisance_error`, `full_visual_error`, `sensory_error` | float32 | scalar |
 | `future_error`, `value_error`, `action_error` | float32 | scalar |
+| `action_changed_count`, `action_changed_cell_count` | int64 | scalar |
+| `action_error_local` | float32 | scalar |
 | `path_len_before/after` | int64 | scalar |
 | `layout_id`, `sample_id`, `layout_seed` | int64 | scalar |
 | `intervention_seed`, `intervention_pair_id` | int64 | scalar |
@@ -310,9 +318,11 @@ Checks:
   - `sensory_nuisance`: high `nuisance_error`, near-zero future/value/action
   - `goal_relocation`: high `value_error`, near-zero future/action
   - `topology_change`: high `future_error`
-  - `action_change`: high `action_error`
+  - `action_change`: changed action transition(s) with high local action error
   - `composed`: ≥ 2 active target labels
 - `weak_action_change` rate (warn if > 10%, hard fail if > 25%)
+- scale-invariant action stats when present: `action_changed_count`,
+  `action_changed_cell_count`, and `action_error_local`
 - `target_multihot` shape and label sums
 - Optional robustness splits (`test_larger.npz`, `test_noisy.npz`) if present
 
