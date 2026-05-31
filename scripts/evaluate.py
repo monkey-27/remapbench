@@ -155,6 +155,10 @@ def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=F
             true_ad.append(batch["action_delta"].numpy())
             if "value_after" in out:
                 pred_va_list.append(out["value_after"].cpu().numpy())
+            elif "delta_value" in out and "value_before" in batch:
+                pred_va_list.append(
+                    (batch["value_before"].to(device) + out["delta_value"]).cpu().numpy()
+                )
             if "gates" in out:
                 gate_list.append(out["gates"].cpu().numpy())
                 iid_list_batched.append(iid_b)
@@ -288,7 +292,10 @@ def main():
 
     model_name = args.model or cfg.get("model", "erpm")
     is_gated   = (model_name == "gated_erpm")
-    has_value_after = model_name in ("gated_erpm", "ungated_latent", "global_plasticity")
+    has_planning_output = model_name in (
+        "erpm", "standard", "standard_cnn",
+        "gated_erpm", "ungated_latent", "global_plasticity",
+    )
 
     device  = get_device(cfg.get("device", "auto"))
     run_dir = os.path.join("results", cfg["run_name"])
@@ -320,7 +327,7 @@ def main():
     model_overall, model_per = evaluate_model(
         model, loader, device, raw,
         threshold=args.threshold,
-        compute_planning=has_value_after,
+        compute_planning=has_planning_output,
     )
 
     print(f"\n=== Neural model ({model_name}) on {args.split} ===")

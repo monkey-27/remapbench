@@ -27,5 +27,5 @@ action_weight: 1.0
 type_weight: 1.0
 future_after_weight: 1.0
 value_after_weight: 1.0
-gate_sparsity_weight: 0.01
-stability_weight: 0.05
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
