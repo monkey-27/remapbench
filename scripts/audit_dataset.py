@@ -42,9 +42,14 @@ CH_NUISANCE, CH_DISTRACTOR, CH_DOOR = 3, 4, 5
 ONE_WAY = [6, 7, 8, 9]
 
 ALL_SPLITS = ["train_single", "val_single", "test_single",
-              "test_composed", "test_larger", "test_noisy"]
+              "test_composed", "test_larger", "test_noisy",
+              "train_composed_seen", "val_composed_seen",
+              "test_composed_seen", "test_composed_heldout"]
 SINGLE_SPLITS = ["train_single", "val_single", "test_single",
                  "test_larger", "test_noisy"]
+COMPOSED_SPLITS = ["train_composed_seen", "val_composed_seen",
+                   "test_composed_seen", "test_composed_heldout",
+                   "test_composed"]
 
 # Default COMPOSED_PAIRS ordering (mirrors remapbench.interventions.COMPOSED_PAIRS).
 # Used to map intervention_pair_id → component intervention names when metadata.json
@@ -193,15 +198,19 @@ def audit(data_dir):
     integrity["class_balance_single"] = class_balance
 
     # 1d. composed pair balance
-    if "test_composed" in splits and "intervention_pair_id" in splits["test_composed"]:
-        pid = splits["test_composed"]["intervention_pair_id"]
+    composed_pair_balance = {}
+    for nm in COMPOSED_SPLITS:
+        if nm not in splits or "intervention_pair_id" not in splits[nm]:
+            continue
+        pid = splits[nm]["intervention_pair_id"]
         uniq = sorted(set(int(x) for x in pid.tolist() if int(x) >= 0))
         counts = [int((pid == u).sum()) for u in uniq]
         imb = _imbalance(counts) if counts else float("nan")
-        integrity["composed_pair_balance"] = {"pair_ids": uniq, "counts": counts,
-                                              "imbalance": imb}
+        composed_pair_balance[nm] = {"pair_ids": uniq, "counts": counts,
+                                     "imbalance": imb}
         if imb == imb and imb > 0.10:
-            warnings.append(f"test_composed: pair imbalance {imb:.2f} > 0.10")
+            warnings.append(f"{nm}: pair imbalance {imb:.2f} > 0.10")
+    integrity["composed_pair_balance"] = composed_pair_balance
 
     report["1_split_integrity"] = integrity
 
@@ -530,13 +539,17 @@ def audit(data_dir):
     # =======================================================================
     # Composed validity
     # =======================================================================
-    if "test_composed" in splits:
-        mh = splits["test_composed"]["target_multihot"]
+    composed_target_invalid = {}
+    for nm in COMPOSED_SPLITS:
+        if nm not in splits:
+            continue
+        mh = splits[nm]["target_multihot"]
         sums = mh.sum(axis=1)
         n_bad = int((sums < 2).sum())
-        report["composed_target_sum_invalid"] = n_bad
+        composed_target_invalid[nm] = n_bad
         if n_bad > 0:
-            hard_fails.append(f"test_composed: {n_bad} samples with <2 active labels")
+            hard_fails.append(f"{nm}: {n_bad} samples with <2 active labels")
+    report["composed_target_sum_invalid"] = composed_target_invalid
 
     # =======================================================================
     # 6. Composed intervention evidence audit
@@ -544,8 +557,10 @@ def audit(data_dir):
     # For each composed sample, verify scalar evidence supports each active
     # component intervention (not just that target_multihot has >=2 labels).
     composed_evidence = {}
-    if "test_composed" in splits:
-        d = splits["test_composed"]
+    for nm in COMPOSED_SPLITS:
+        if nm not in splits:
+            continue
+        d = splits[nm]
         n = len(d["intervention_id"])
         ne = _get(d, "nuisance_error", n)
         fe = _get(d, "future_error", n)
@@ -579,11 +594,11 @@ def audit(data_dir):
 
         if not uniq:
             # No pair ids — cannot attribute evidence to components.
-            warnings.append("test_composed: intervention_pair_id absent; "
+            warnings.append(f"{nm}: intervention_pair_id absent; "
                             "cannot run composed component-evidence audit")
         for u in uniq:
             if u >= len(composed_pairs):
-                warnings.append(f"test_composed: pair_id {u} out of range of "
+                warnings.append(f"{nm}: pair_id {u} out of range of "
                                 f"known composed_pairs ({len(composed_pairs)})")
                 continue
             compA, compB = composed_pairs[u][0], composed_pairs[u][1]
@@ -614,17 +629,17 @@ def audit(data_dir):
             }
             if "action_change" in (compA, compB):
                 entry["weak_action_change_rate"] = float(weak[mask].mean())
-            composed_evidence[f"pair_{u}"] = entry
+            composed_evidence[f"{nm}.pair_{u}"] = entry
 
             # Hard-fail rules
             if entry["all_components_pass_rate"] < COMPOSED_EVID_MIN:
                 hard_fails.append(
-                    f"test_composed[{compA}+{compB}]: all-components evidence rate "
+                    f"{nm}[{compA}+{compB}]: all-components evidence rate "
                     f"{entry['all_components_pass_rate']:.2f} < {COMPOSED_EVID_MIN}")
             for comp, rate in entry["component_pass_rates"].items():
                 if rate < COMPOSED_EVID_MIN:
                     hard_fails.append(
-                        f"test_composed[{compA}+{compB}]: component '{comp}' evidence "
+                        f"{nm}[{compA}+{compB}]: component '{comp}' evidence "
                         f"rate {rate:.2f} < {COMPOSED_EVID_MIN}")
     report["6_composed_evidence"] = composed_evidence
 
@@ -713,8 +728,10 @@ def audit(data_dir):
         action_meta[nm] = ent
 
     # 7b. Composed splits with an action component
-    if "test_composed" in splits and "action_cell_row" in splits["test_composed"]:
-        d = splits["test_composed"]
+    for nm in COMPOSED_SPLITS:
+        if nm not in splits or "action_cell_row" not in splits[nm]:
+            continue
+        d = splits[nm]
         n = len(d["intervention_id"])
         row = d["action_cell_row"].astype(np.int64)
         col = d["action_cell_col"].astype(np.int64)
@@ -731,7 +748,7 @@ def audit(data_dir):
                 frac_missing = float(missing_cell.mean())
                 frac_changed_ok = float((changed_count[amask] >= 1).mean())
                 frac_action_local_ok = float((action_local[amask] >= ACTION_LOCAL_MIN).mean())
-                action_meta["test_composed"] = {
+                action_meta[nm] = {
                     "n_action_composed": na,
                     "frac_missing_cell": frac_missing,
                     "frac_action_changed_count_above_min": frac_changed_ok,
@@ -739,15 +756,15 @@ def audit(data_dir):
                 }
                 if frac_missing > 0.15:
                     hard_fails.append(
-                        f"test_composed: {frac_missing:.2f} of action-composed "
+                        f"{nm}: {frac_missing:.2f} of action-composed "
                         "samples missing action cell metadata (>0.15)")
                 if frac_changed_ok < COMPOSED_EVID_MIN:
                     hard_fails.append(
-                        f"test_composed: only {frac_changed_ok:.2f} of "
+                        f"{nm}: only {frac_changed_ok:.2f} of "
                         "action-composed samples have action_changed_count >= 1")
                 if frac_action_local_ok < COMPOSED_EVID_MIN:
                     hard_fails.append(
-                        f"test_composed: only {frac_action_local_ok:.2f} of "
+                        f"{nm}: only {frac_action_local_ok:.2f} of "
                         f"action-composed samples have action_error_local >= {ACTION_LOCAL_MIN}")
     report["7_action_metadata_consistency"] = action_meta
 

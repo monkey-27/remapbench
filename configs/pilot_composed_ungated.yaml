@@ -1,4 +1,4 @@
-data_dir: data/remapbench_v0
+data_dir: data/remapbench_v1_composed
 grid_size: 10
 seed: 0
 n_train: 12000
@@ -16,8 +16,10 @@ gamma: 0.95
 batch_size: 128
 epochs: 30
 lr: 0.001
-run_name: pilot_gated_erpm_seed0
-model: gated_erpm
+run_name: pilot_composed_ungated_seed0
+model: ungated_latent
+train_splits: ["train_single", "train_composed_seen"]
+val_splits: ["val_single", "val_composed_seen"]
 device: auto
 future_weight: 1.0
 value_weight: 1.0

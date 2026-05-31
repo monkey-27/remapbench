@@ -177,13 +177,34 @@ def evaluate_model(model, loader, device, raw, threshold=0.5, compute_planning=F
     # Planning metrics using predicted value_after (under the ablated gate if applicable)
     if compute_planning and pred_va_list and raw is not None:
         pred_va_np   = np.concatenate(pred_va_list, 0)  # [N,1,H,W]
-        oracle_lens  = _oracle_path_lens(raw, None)
-        value_maps   = [pred_va_np[i, 0] for i in range(len(pred_va_np))]
+        oracle_lens = raw.get("path_len_after")
+        if oracle_lens is None:
+            oracle_lens = _oracle_path_lens(raw, None)
+        value_maps = [pred_va_np[i, 0] for i in range(len(pred_va_np))]
         plan_metrics = compute_planning_metrics(
             list(raw["after_grid"]), list(raw["start_xy"]), list(raw["goal_after_xy"]),
             value_maps, oracle_lens, max_steps=50, penalty=50,
         )
         overall["planning"] = plan_metrics
+        oracle_metrics = compute_planning_metrics(
+            list(raw["after_grid"]), list(raw["start_xy"]), list(raw["goal_after_xy"]),
+            list(raw["value_after"]), oracle_lens, max_steps=50, penalty=50,
+        )
+        stale_metrics = compute_planning_metrics(
+            list(raw["after_grid"]), list(raw["start_xy"]), list(raw["goal_after_xy"]),
+            list(raw["value_before"]), oracle_lens, max_steps=50, penalty=50,
+        )
+        overall["planning_diagnostics"] = {
+            "planning_pred_success_rate": plan_metrics["planning_success_rate"],
+            "planning_pred_mean_step_regret": plan_metrics["mean_step_regret"],
+            "planning_oracle_value_success_rate": oracle_metrics["planning_success_rate"],
+            "planning_oracle_value_mean_step_regret": oracle_metrics["mean_step_regret"],
+            "planning_stale_value_success_rate": stale_metrics["planning_success_rate"],
+            "planning_stale_value_mean_step_regret": stale_metrics["mean_step_regret"],
+            "predicted": plan_metrics,
+            "oracle_value": oracle_metrics,
+            "stale_value": stale_metrics,
+        }
 
     # Mean gate activations per intervention type (reflects final/overridden gates)
     gate_by_itype = {}
@@ -253,7 +274,9 @@ def main():
     parser.add_argument("--checkpoint",    required=True)
     parser.add_argument("--split",         default="test_single",
                         choices=["test_single", "test_composed", "val_single",
-                                 "test_larger", "test_noisy"])
+                                 "test_larger", "test_noisy", "train_composed_seen",
+                                 "val_composed_seen", "test_composed_seen",
+                                 "test_composed_heldout"])
     parser.add_argument("--model",         default=None)
     parser.add_argument("--threshold",     type=float, default=0.5)
     parser.add_argument("--gate_ablations", action="store_true",
@@ -265,6 +288,7 @@ def main():
 
     model_name = args.model or cfg.get("model", "erpm")
     is_gated   = (model_name == "gated_erpm")
+    has_value_after = model_name in ("gated_erpm", "ungated_latent", "global_plasticity")
 
     device  = get_device(cfg.get("device", "auto"))
     run_dir = os.path.join("results", cfg["run_name"])
@@ -296,7 +320,7 @@ def main():
     model_overall, model_per = evaluate_model(
         model, loader, device, raw,
         threshold=args.threshold,
-        compute_planning=is_gated,
+        compute_planning=has_value_after,
     )
 
     print(f"\n=== Neural model ({model_name}) on {args.split} ===")

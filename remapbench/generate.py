@@ -60,6 +60,10 @@ SPLIT_IDS = {
     "test_composed": 3,
     "test_larger":   4,
     "test_noisy":    5,
+    "train_composed_seen":   6,
+    "val_composed_seen":     7,
+    "test_composed_seen":    8,
+    "test_composed_heldout": 9,
 }
 
 LAYOUT_ID_STRIDE = 1_000_000_000   # layout_id = split_id * LAYOUT_ID_STRIDE + index
@@ -254,6 +258,20 @@ def _balanced_schedule(n, types, rng):
     return sched
 
 
+def _balanced_pair_schedule(n, pair_ids, rng):
+    """Build a shuffled schedule balanced across the requested composed pairs."""
+    pair_ids = list(pair_ids)
+    if not pair_ids:
+        raise ValueError("composed split requires at least one pair id")
+    per = n // len(pair_ids)
+    rem = n % len(pair_ids)
+    sched = []
+    for pair_id in pair_ids:
+        sched.extend([pair_id] * per)
+    sched.extend(pair_ids[:rem])
+    return [sched[i] for i in rng.permutation(len(sched))]
+
+
 # ---------------------------------------------------------------------------
 # Save / load helpers
 # ---------------------------------------------------------------------------
@@ -278,6 +296,9 @@ def generate_dataset(
     out_dir, seed=0, H=10, W=10,
     n_train=12000, n_val=2000, n_test=2000, n_composed=2000,
     n_test_larger=0, n_test_noisy=0,
+    n_train_composed_seen=0, n_val_composed_seen=0,
+    n_test_composed_seen=0, n_test_composed_heldout=0,
+    heldout_composed_pair_id=2,
     gamma=0.95, verbose=True,
 ):
     os.makedirs(out_dir, exist_ok=True)
@@ -289,32 +310,38 @@ def generate_dataset(
     splits = {}
     global_id = 0  # monotonic sample_id counter across splits
 
-    # (name, n, is_composed, H, W, nuisance_prob, distractor_prob)
-    spec = [
-        ("train_single",  n_train,       False, H,  W,  0.15, 0.10),
-        ("val_single",    n_val,         False, H,  W,  0.15, 0.10),
-        ("test_single",   n_test,        False, H,  W,  0.15, 0.10),
-        ("test_composed", n_composed,    True,  H,  W,  0.15, 0.10),
-        ("test_larger",   n_test_larger, False, 12, 12, 0.15, 0.10),
-        ("test_noisy",    n_test_noisy,  False, H,  W,  0.35, 0.25),
+    all_pair_ids = list(range(len(COMPOSED_PAIRS)))
+    if heldout_composed_pair_id not in all_pair_ids:
+        raise ValueError(
+            f"heldout_composed_pair_id={heldout_composed_pair_id} is out of range")
+    seen_composed_pair_ids = [
+        pair_id for pair_id in all_pair_ids
+        if pair_id != heldout_composed_pair_id
     ]
 
-    for split_name, n, is_composed, Hs, Ws, nz, dz in spec:
+    # (name, n, composed_pair_ids-or-None, H, W, nuisance_prob, distractor_prob)
+    spec = [
+        ("train_single",          n_train,                    None, H,  W,  0.15, 0.10),
+        ("val_single",            n_val,                      None, H,  W,  0.15, 0.10),
+        ("test_single",           n_test,                     None, H,  W,  0.15, 0.10),
+        ("test_composed",         n_composed,                 all_pair_ids, H, W, 0.15, 0.10),
+        ("test_larger",           n_test_larger,              None, 12, 12, 0.15, 0.10),
+        ("test_noisy",            n_test_noisy,               None, H,  W,  0.35, 0.25),
+        ("train_composed_seen",   n_train_composed_seen,      seen_composed_pair_ids, H, W, 0.15, 0.10),
+        ("val_composed_seen",     n_val_composed_seen,        seen_composed_pair_ids, H, W, 0.15, 0.10),
+        ("test_composed_seen",    n_test_composed_seen,       seen_composed_pair_ids, H, W, 0.15, 0.10),
+        ("test_composed_heldout", n_test_composed_heldout,    [heldout_composed_pair_id], H, W, 0.15, 0.10),
+    ]
+
+    for split_name, n, composed_pair_ids, Hs, Ws, nz, dz in spec:
         if n <= 0:
             splits[split_name] = []
             continue
         split_id = SPLIT_IDS[split_name]
         print(f"Generating {split_name} ({n} samples, grid={Hs}x{Ws}, split_id={split_id})...")
 
-        if is_composed:
-            n_pairs = len(COMPOSED_PAIRS)
-            per = n // n_pairs
-            rem = n % n_pairs
-            pair_sched_raw = []
-            for pi in range(n_pairs):
-                pair_sched_raw.extend([pi] * per)
-            pair_sched_raw.extend(list(range(rem)))
-            pair_sched_raw = [pair_sched_raw[i] for i in master_rng.permutation(len(pair_sched_raw))]
+        if composed_pair_ids is not None:
+            pair_sched_raw = _balanced_pair_schedule(n, composed_pair_ids, master_rng)
             itype_sched = ["composed"] * len(pair_sched_raw)
         else:
             itype_sched = _balanced_schedule(n, SINGLE_INTERVENTIONS, master_rng)
@@ -339,6 +366,15 @@ def generate_dataset(
     metadata = {
         "intervention_names": {str(v): k for k, v in INTERVENTION_IDS.items()},
         "composed_pairs":     [list(p) for p in COMPOSED_PAIRS],
+        "heldout_composed_pair_id": int(heldout_composed_pair_id),
+        "seen_composed_pair_ids": [int(x) for x in seen_composed_pair_ids],
+        "composed_split_pair_ids": {
+            "test_composed": [int(x) for x in all_pair_ids],
+            "train_composed_seen": [int(x) for x in seen_composed_pair_ids],
+            "val_composed_seen": [int(x) for x in seen_composed_pair_ids],
+            "test_composed_seen": [int(x) for x in seen_composed_pair_ids],
+            "test_composed_heldout": [int(heldout_composed_pair_id)],
+        },
         "target_labels":      ["sensory_update", "value_remap", "map_remap", "action_remap"],
         "channels": {
             "0": "wall", "1": "start", "2": "goal",
@@ -378,6 +414,10 @@ def generate_dataset(
             "test_composed": int(n_composed),
             "test_larger":   int(n_test_larger),
             "test_noisy":    int(n_test_noisy),
+            "train_composed_seen":   int(n_train_composed_seen),
+            "val_composed_seen":     int(n_val_composed_seen),
+            "test_composed_seen":    int(n_test_composed_seen),
+            "test_composed_heldout": int(n_test_composed_heldout),
         },
         "min_saved_fraction_recommended": 0.95,
         "split_ids": SPLIT_IDS,
@@ -410,13 +450,24 @@ def main():
     parser.add_argument("--n_composed",     type=int, default=2000)
     parser.add_argument("--n_test_larger",  type=int, default=0)
     parser.add_argument("--n_test_noisy",   type=int, default=0)
+    parser.add_argument("--n_train_composed_seen",   type=int, default=0)
+    parser.add_argument("--n_val_composed_seen",     type=int, default=0)
+    parser.add_argument("--n_test_composed_seen",    type=int, default=0)
+    parser.add_argument("--n_test_composed_heldout", type=int, default=0)
+    parser.add_argument("--heldout_composed_pair_id", type=int, default=2)
     parser.add_argument("--gamma",          type=float, default=0.95)
     args = parser.parse_args()
     generate_dataset(
         out_dir=args.out, seed=args.seed, H=args.grid_size, W=args.grid_size,
         n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
         n_composed=args.n_composed, n_test_larger=args.n_test_larger,
-        n_test_noisy=args.n_test_noisy, gamma=args.gamma,
+        n_test_noisy=args.n_test_noisy,
+        n_train_composed_seen=args.n_train_composed_seen,
+        n_val_composed_seen=args.n_val_composed_seen,
+        n_test_composed_seen=args.n_test_composed_seen,
+        n_test_composed_heldout=args.n_test_composed_heldout,
+        heldout_composed_pair_id=args.heldout_composed_pair_id,
+        gamma=args.gamma,
     )
 
 

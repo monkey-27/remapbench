@@ -93,6 +93,10 @@ def validate(data_dir):
     optional_files = {
         "test_larger": "test_larger.npz",
         "test_noisy":  "test_noisy.npz",
+        "train_composed_seen":   "train_composed_seen.npz",
+        "val_composed_seen":     "val_composed_seen.npz",
+        "test_composed_seen":    "test_composed_seen.npz",
+        "test_composed_heldout": "test_composed_heldout.npz",
     }
 
     splits = {}

@@ -17,7 +17,7 @@ import numpy as np
 import yaml
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from remapbench.data import RemapDataset
 from models import build_model
@@ -166,7 +166,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--model",  default=None,
-                        choices=["erpm", "standard", "gated_erpm", None])
+                        choices=["erpm", "standard", "standard_cnn", "gated_erpm",
+                                 "ungated_latent", "global_plasticity", None])
     parser.add_argument("--seed",   type=int, default=0)
     args = parser.parse_args()
 
@@ -174,7 +175,7 @@ def main():
         cfg = yaml.safe_load(f)
 
     model_name = args.model or cfg.get("model", "erpm")
-    is_gated   = (model_name == "gated_erpm")
+    is_gated   = model_name in ("gated_erpm", "ungated_latent", "global_plasticity")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -187,9 +188,16 @@ def main():
     shutil.copy(args.config, os.path.join(run_dir, "config.yaml"))
 
     data_dir = cfg["data_dir"]
-    train_ds = RemapDataset(os.path.join(data_dir, "train_single.npz"))
-    val_ds   = RemapDataset(os.path.join(data_dir, "val_single.npz"))
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    train_splits = cfg.get("train_splits", ["train_single"])
+    val_splits   = cfg.get("val_splits", ["val_single"])
+    train_parts = [RemapDataset(os.path.join(data_dir, f"{name}.npz"))
+                   for name in train_splits]
+    val_parts   = [RemapDataset(os.path.join(data_dir, f"{name}.npz"))
+                   for name in val_splits]
+    train_ds = train_parts[0] if len(train_parts) == 1 else ConcatDataset(train_parts)
+    val_ds   = val_parts[0] if len(val_parts) == 1 else ConcatDataset(val_parts)
+    print(f"Train splits: {train_splits} ({len(train_ds)} samples)")
+    print(f"Val splits:   {val_splits} ({len(val_ds)} samples)")
 
     train_loader = DataLoader(train_ds, batch_size=cfg.get("batch_size", 32),
                               shuffle=True,  num_workers=0, drop_last=False)
@@ -227,7 +235,9 @@ def main():
         print(f"Ep {ep:3d}/{epochs} | tr={tr_loss:.4f} | vl={vl_loss:.4f} | "
               f"macro_f1={f1['macro_f1']:.3f} | exact={f1['exact_match']:.3f} | {elapsed:.1f}s")
 
-        row = {"epoch": ep, "train_loss": tr_loss, "val_loss": vl_loss, **f1, **comps}
+        row = {"epoch": ep, "train_splits": train_splits, "val_splits": val_splits,
+               "n_train_samples": len(train_ds), "n_val_samples": len(val_ds),
+               "train_loss": tr_loss, "val_loss": vl_loss, **f1, **comps}
         log_f.write(json.dumps(row) + "\n")
         log_f.flush()
 

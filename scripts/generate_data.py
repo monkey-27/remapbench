@@ -31,6 +31,11 @@ def main():
         n_composed=cfg.get("n_composed", 2000),
         n_test_larger=cfg.get("n_test_larger", 0),
         n_test_noisy=cfg.get("n_test_noisy", 0),
+        n_train_composed_seen=cfg.get("n_train_composed_seen", 0),
+        n_val_composed_seen=cfg.get("n_val_composed_seen", 0),
+        n_test_composed_seen=cfg.get("n_test_composed_seen", 0),
+        n_test_composed_heldout=cfg.get("n_test_composed_heldout", 0),
+        heldout_composed_pair_id=cfg.get("heldout_composed_pair_id", 2),
         gamma=cfg.get("gamma", 0.95),
     )
 

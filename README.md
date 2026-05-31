@@ -53,7 +53,9 @@ metrics, delta_future/value/action MSE, and planning behavior under each overrid
 A greedy value-following policy uses `value_after` predictions as a navigation signal.
 At each step the agent moves to the highest-predicted-value non-visited neighbor.
 Planning metrics: `planning_success_rate`, `mean_step_regret` vs oracle directed path,
-`failure_rate`. Available when `model=gated_erpm`.
+`failure_rate`. Evaluation also records `planning_diagnostics` for predicted
+`value_after`, oracle `value_after`, and stale `value_before`. If oracle-value
+greedy planning is poor, de-emphasize the greedy planner metric itself.
 
 ---
 
@@ -282,9 +284,20 @@ behaviorally meaningful rather than cosmetic local perturbations.
 | `test_composed` | 3 | 2 000 | balanced composed |
 | `test_larger` | 4 | 0 (1 000 in pilot) | balanced single, 12×12 |
 | `test_noisy` | 5 | 0 (1 000 in pilot) | balanced single, noisy |
+| `train_composed_seen` | 6 | 4 000 in composed pilot | composed pairs 0, 1, 3 |
+| `val_composed_seen` | 7 | 1 000 in composed pilot | composed pairs 0, 1, 3 |
+| `test_composed_seen` | 8 | 1 000 in composed pilot | composed pairs 0, 1, 3 |
+| `test_composed_heldout` | 9 | 1 000 in composed pilot | held-out composed pair 2 |
 
 `test_larger`: 12×12 grid (vs default 10×10), tests generalisation to unseen grid size.
 `test_noisy`: higher nuisance density (`nuisance_prob=0.35`, `distractor_prob=0.25`).
+
+The composed-training setup keeps global composed pair IDs stable:
+`0=goal+topology`, `1=sensory+action`, `2=goal+action`,
+`3=sensory+topology`. With `heldout_composed_pair_id: 2`, training and
+validation see pairs `0,1,3`; `test_composed_heldout` measures generalization
+to the unseen goal-plus-action composition. Legacy `test_composed` remains a
+balanced aggregate over all pairs.
 
 **Provably-disjoint layout IDs and seeds.** Layout IDs and RNG seeds are derived
 arithmetically from `(seed, split_id, sample_index, attempt)`:
@@ -337,6 +350,9 @@ python scripts/train.py --config configs/smoke.yaml
 ```
 
 `--model` defaults to `cfg["model"]` (i.e., `gated_erpm` in the provided configs).
+When `train_splits` and `val_splits` are configured, training concatenates the
+listed `.npz` datasets without physically merging files. If omitted, the
+backward-compatible defaults are `train_single` and `val_single`.
 
 **Loss (GatedERPM)**:
 ```
@@ -372,6 +388,7 @@ Reports:
 - Missed remap rates per structural label
 - Δfuture / Δvalue / action_delta MSE
 - Planning metrics (`planning_success_rate`, `mean_step_regret`, `failure_rate`)
+- Planning diagnostics for predicted, oracle-value, and stale-value maps
 - Mean gate activations per intervention type
 - Per-intervention breakdown
 
@@ -385,6 +402,23 @@ Also evaluates **heuristic baselines**:
 - `action_gated`: action_error > threshold → action_remap
 - `global_plasticity`: any error > threshold → activate all corresponding labels
 - `oracle`: ground-truth target (upper bound)
+
+### Next composed-training commands *(documented only)*
+
+```bash
+python3 scripts/generate_data.py --config configs/pilot_composed.yaml
+python3 -m remapbench.validate --data_dir data/remapbench_v1_composed
+python3 scripts/audit_dataset.py --data_dir data/remapbench_v1_composed \
+    --out data/remapbench_v1_composed/audit_report.json --strict
+# Train only after the strict audit reports PILOT READY: YES.
+python3 scripts/train.py --config configs/pilot_composed.yaml
+python3 scripts/train.py --config configs/pilot_composed_standard.yaml
+python3 scripts/train.py --config configs/pilot_composed_ungated.yaml
+python3 scripts/train.py --config configs/pilot_composed_global.yaml
+python3 scripts/evaluate.py --config configs/pilot_composed.yaml \
+    --checkpoint results/pilot_composed_gated_erpm_seed0/best.pt \
+    --split test_composed_heldout
+```
 
 ---
 
