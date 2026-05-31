@@ -196,11 +196,52 @@ class GatedERPM(nn.Module):
 
 class UngatedLatent(GatedERPM):
     """Latent-update baseline with every pathway always active."""
-    def forward(self, x, gate_override=None, target_multihot=None):
-        return super().forward(
-            x, gate_override=gate_override or "all_one",
-            target_multihot=target_multihot,
+    def __init__(self, n_grid=N_GRID, latent=LATENT):
+        super().__init__(n_grid=n_grid, latent=latent)
+        self.gate_net = nn.Identity()
+        self.remap_classifier = nn.Sequential(
+            nn.Linear(latent, 32), nn.ReLU(inplace=True),
+            nn.Linear(32, 4),
         )
+
+    def forward(self, x, gate_override=None, target_multihot=None):
+        z_before = self.encoder(x[:, :N_GRID])
+        z_after  = self.encoder(x[:, N_GRID:])
+        diff = z_after - z_before
+        err_in = torch.cat([z_before, z_after, diff, diff.abs()], dim=1)
+        error_features = self.error_net(err_in)
+
+        pooled = error_features.mean(dim=(2, 3))
+        remap_logits = self.remap_classifier(pooled)
+        final_gates = torch.ones(x.size(0), 4, device=x.device, dtype=x.dtype)
+
+        u_sensory = self.sensory_head(error_features)
+        u_value   = self.value_head(error_features)
+        u_map     = self.map_head(error_features)
+        u_action  = self.action_head(error_features)
+        z_updated = z_before + u_sensory + u_value + u_map + u_action
+
+        return {
+            "future_after":     self.future_after_head(z_updated),
+            "value_after":      self.value_after_head(z_updated),
+            "delta_future":     self.delta_future_head(z_updated),
+            "delta_value":      self.delta_value_head(z_updated),
+            "action_delta":     self.action_delta_head(z_updated),
+            "remap_logits":     remap_logits,
+            "raw_gate_logits":  _safe_logit(final_gates),
+            "raw_gates":        final_gates,
+            "gates":            final_gates,
+            "gate_logits":      _safe_logit(final_gates),
+            "z_before":         z_before,
+            "z_after":          z_after,
+            "z_updated":        z_updated,
+            "pathway_updates": {
+                "sensory": u_sensory,
+                "value":   u_value,
+                "map":     u_map,
+                "action":  u_action,
+            },
+        }
 
 
 class GlobalPlasticity(GatedERPM):
@@ -210,6 +251,10 @@ class GlobalPlasticity(GatedERPM):
         self.gate_net = nn.Sequential(
             nn.Linear(latent, 32), nn.ReLU(inplace=True),
             nn.Linear(32, 1),
+        )
+        self.remap_classifier = nn.Sequential(
+            nn.Linear(latent, 32), nn.ReLU(inplace=True),
+            nn.Linear(32, 4),
         )
 
     def forward(self, x, gate_override=None, target_multihot=None):
@@ -222,6 +267,7 @@ class GlobalPlasticity(GatedERPM):
         pooled = error_features.mean(dim=(2, 3))
         raw_global_logits = self.gate_net(pooled)
         raw_global_gate = torch.sigmoid(raw_global_logits)
+        remap_logits = self.remap_classifier(pooled)
         raw_gates = raw_global_gate.expand(-1, 4)
         if gate_override is not None:
             final_gates = self._apply_override(raw_gates, gate_override, target_multihot)
@@ -243,7 +289,7 @@ class GlobalPlasticity(GatedERPM):
             "delta_future":     self.delta_future_head(z_updated),
             "delta_value":      self.delta_value_head(z_updated),
             "action_delta":     self.action_delta_head(z_updated),
-            "remap_logits":     raw_global_logits.expand(-1, 4),
+            "remap_logits":     remap_logits,
             "raw_gate_logits":  raw_global_logits.expand(-1, 4),
             "raw_gates":        raw_gates,
             "gates":            final_gates,
