@@ -1,0 +1,24 @@
+data_dir: data/remapbench_cpo_pilot
+batch_size: 128
+tuple_batch_size: 32
+epochs: 30
+lr: 0.001
+run_name: fepo_pilot_no_evidence_invariance_seed0
+model: fepo_no_evidence_invariance
+train_splits: ["train_single", "train_composed_seen"]
+val_splits: ["val_single", "val_composed_seen"]
+tuple_train_split: train_tuple_seen
+tuple_val_split: val_tuple_seen
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
+evidence_invariance_weight: 0.0
+inactive_evidence_weight: 0.1
+gate_or_weight: 0.2
+operator_reuse_weight: 0.1
