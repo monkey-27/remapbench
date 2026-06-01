@@ -212,6 +212,23 @@ def audit(data_dir):
             warnings.append(f"{nm}: pair imbalance {imb:.2f} > 0.10")
     integrity["composed_pair_balance"] = composed_pair_balance
 
+    # 1e. metadata-driven composed split membership
+    membership = {}
+    if metadata and isinstance(metadata.get("composed_split_pair_ids"), dict):
+        for nm, expected_ids in metadata["composed_split_pair_ids"].items():
+            if nm not in splits or "intervention_pair_id" not in splits[nm]:
+                continue
+            expected = sorted(int(x) for x in expected_ids)
+            actual = sorted(set(int(x) for x in splits[nm]["intervention_pair_id"] if int(x) >= 0))
+            membership[nm] = {"expected_pair_ids": expected, "actual_pair_ids": actual}
+            if actual != expected:
+                hard_fails.append(
+                    f"{nm}: composed pair membership {actual} != metadata expectation {expected}")
+    else:
+        warnings.append("metadata.json missing composed_split_pair_ids; "
+                        "cannot verify seen/heldout pair membership")
+    integrity["composed_pair_membership"] = membership
+
     report["1_split_integrity"] = integrity
 
     # =======================================================================

@@ -40,6 +40,7 @@ def main():
         n_test_tuple_seen=cfg.get("n_test_tuple_seen", 0),
         n_test_tuple_heldout=cfg.get("n_test_tuple_heldout", 0),
         heldout_composed_pair_id=cfg.get("heldout_composed_pair_id", 2),
+        include_all_composed_pairs_train=cfg.get("include_all_composed_pairs_train", False),
         gamma=cfg.get("gamma", 0.95),
     )
 

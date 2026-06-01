@@ -204,7 +204,7 @@ def _generate_one(
 
 
 def _with_tuple_meta(sample, tuple_id, role, pair_id, component_a, component_b,
-                     b_replay_mask):
+                     b_replay_mask, b_replay_values):
     sample.update(
         tuple_id=np.int64(tuple_id),
         tuple_role=np.array(role),
@@ -214,6 +214,8 @@ def _with_tuple_meta(sample, tuple_id, role, pair_id, component_a, component_b,
         tuple_component_b=np.array(component_b),
         tuple_replay_order=np.array("A_then_B"),
         tuple_b_replay_mask=b_replay_mask.astype(np.uint8),
+        tuple_b_replay_values=b_replay_values.astype(np.uint8),
+        tuple_b_is_independent_base=np.uint8(1),
     )
     return sample
 
@@ -241,12 +243,11 @@ def _generate_tuple_one(
     )
     result_a = apply_intervention(grid, start, goal, np.random.default_rng(seed_a), component_a)
     g_a, goal_a, _, multihot_a, weak_a, meta_a = result_a
+    result_b = apply_intervention(grid, start, goal, np.random.default_rng(seed_b), component_b)
+    g_b, goal_b, _, multihot_b, weak_b, meta_b = result_b
     result_ab_b = apply_intervention(g_a, start, goal_a, np.random.default_rng(seed_b), component_b)
-    g_ab, goal_ab, _, multihot_b, weak_b, meta_b = result_ab_b
+    g_ab, goal_ab, _, multihot_ab_b, weak_ab_b, meta_ab_b = result_ab_b
     changed_b = g_ab != g_a
-    g_b = grid.copy()
-    g_b[changed_b] = g_ab[changed_b]
-    goal_b = goal_ab if goal_ab != goal_a else goal
     sample_a = _validate_sample(build_sample_arrays(
         grid, g_a, start, goal, goal_a,
         INTERVENTION_IDS[component_a], multihot_a, gamma,
@@ -262,21 +263,21 @@ def _generate_tuple_one(
         intervention_pair_id=pair_id, weak_action_change=weak_b, action_meta=meta_b,
     ), component_b, weak_b, multihot_b)
 
-    multihot_ab = np.maximum(multihot_a, multihot_b).tolist()
-    action_meta = meta_a if meta_a.get("action_cell_row", -1) != -1 else meta_b
+    multihot_ab = np.maximum(multihot_a, multihot_ab_b).tolist()
+    action_meta = meta_a if meta_a.get("action_cell_row", -1) != -1 else meta_ab_b
     sample_ab = _validate_sample(build_sample_arrays(
         grid, g_ab, start, goal, goal_ab,
         INTERVENTION_IDS["composed"], multihot_ab, gamma,
         layout_id=layout_id, sample_id=sample_id_offset + 3,
         layout_seed=layout_seed, intervention_seed=seed_b,
         intervention_pair_id=pair_id,
-        weak_action_change=max(weak_a, weak_b), action_meta=action_meta,
-    ), "composed", max(weak_a, weak_b), multihot_ab)
+        weak_action_change=max(weak_a, weak_ab_b), action_meta=action_meta,
+    ), "composed", max(weak_a, weak_ab_b), multihot_ab)
     return [
-        _with_tuple_meta(base, tuple_id, "base", pair_id, component_a, component_b, changed_b),
-        _with_tuple_meta(sample_a, tuple_id, "A", pair_id, component_a, component_b, changed_b),
-        _with_tuple_meta(sample_b, tuple_id, "B", pair_id, component_a, component_b, changed_b),
-        _with_tuple_meta(sample_ab, tuple_id, "AB", pair_id, component_a, component_b, changed_b),
+        _with_tuple_meta(base, tuple_id, "base", pair_id, component_a, component_b, changed_b, g_ab),
+        _with_tuple_meta(sample_a, tuple_id, "A", pair_id, component_a, component_b, changed_b, g_ab),
+        _with_tuple_meta(sample_b, tuple_id, "B", pair_id, component_a, component_b, changed_b, g_ab),
+        _with_tuple_meta(sample_ab, tuple_id, "AB", pair_id, component_a, component_b, changed_b, g_ab),
     ]
 
 
@@ -403,6 +404,8 @@ def _balanced_pair_schedule(n, pair_ids, rng):
 
 def save_split(samples, path):
     if not samples:
+        if os.path.exists(path):
+            os.remove(path)
         print(f"  [WARN] Nothing to save for {path}")
         return
     arrays = {k: np.array([s[k] for s in samples]) for k in samples[0]}
@@ -426,6 +429,7 @@ def generate_dataset(
     n_train_tuple_seen=0, n_val_tuple_seen=0,
     n_test_tuple_seen=0, n_test_tuple_heldout=0,
     heldout_composed_pair_id=2,
+    include_all_composed_pairs_train=False,
     gamma=0.95, verbose=True,
 ):
     os.makedirs(out_dir, exist_ok=True)
@@ -441,10 +445,12 @@ def generate_dataset(
     if heldout_composed_pair_id not in all_pair_ids:
         raise ValueError(
             f"heldout_composed_pair_id={heldout_composed_pair_id} is out of range")
-    seen_composed_pair_ids = [
-        pair_id for pair_id in all_pair_ids
-        if pair_id != heldout_composed_pair_id
-    ]
+    seen_composed_pair_ids = (
+        all_pair_ids if include_all_composed_pairs_train else [
+            pair_id for pair_id in all_pair_ids
+            if pair_id != heldout_composed_pair_id
+        ]
+    )
     seen_tuple_pair_ids = seen_composed_pair_ids
 
     # (name, n, composed_pair_ids-or-None, H, W, nuisance_prob, distractor_prob)
@@ -514,8 +520,14 @@ def generate_dataset(
         "intervention_names": {str(v): k for k, v in INTERVENTION_IDS.items()},
         "composed_pairs":     [list(p) for p in COMPOSED_PAIRS],
         "heldout_composed_pair_id": int(heldout_composed_pair_id),
+        "include_all_composed_pairs_train": bool(include_all_composed_pairs_train),
         "seen_composed_pair_ids": [int(x) for x in seen_composed_pair_ids],
         "tuple_roles": ["base", "A", "B", "AB"],
+        "tuple_semantics": {
+            "A": "A(base)",
+            "B": "B(base), generated independently of A",
+            "AB": "B(A(base)), with sequential B replay mask and values stored explicitly",
+        },
         "tuple_heldout_pair_id": int(heldout_composed_pair_id),
         "tuple_split_pair_ids": {
             "train_tuple_seen": [int(x) for x in seen_tuple_pair_ids],
@@ -624,6 +636,7 @@ def main():
     parser.add_argument("--n_test_tuple_seen",    type=int, default=0)
     parser.add_argument("--n_test_tuple_heldout", type=int, default=0)
     parser.add_argument("--heldout_composed_pair_id", type=int, default=2)
+    parser.add_argument("--include_all_composed_pairs_train", action="store_true")
     parser.add_argument("--gamma",          type=float, default=0.95)
     args = parser.parse_args()
     generate_dataset(
@@ -640,6 +653,7 @@ def main():
         n_test_tuple_seen=args.n_test_tuple_seen,
         n_test_tuple_heldout=args.n_test_tuple_heldout,
         heldout_composed_pair_id=args.heldout_composed_pair_id,
+        include_all_composed_pairs_train=args.include_all_composed_pairs_train,
         gamma=args.gamma,
     )
 

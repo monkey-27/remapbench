@@ -1,0 +1,28 @@
+data_dir: data/final_decomp_gap/seen_upper_bound
+model: standard_cnn
+report_model_name: standard
+seed: 0
+run_name: final_seen_upper_bound_standard_seed0
+train_splits:
+- train_single
+- train_composed_seen
+val_splits:
+- val_single
+- val_composed_seen
+batch_size: 128
+epochs: 30
+lr: 0.001
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
+checkpoint_metric: best_val_composed_seen_exact
+fold_id: seen_upper_bound
+fold_name: seen_upper_bound
+heldout_composed_pair_id: 2
+include_all_composed_pairs_train: true

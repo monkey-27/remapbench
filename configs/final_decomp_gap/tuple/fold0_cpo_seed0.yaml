@@ -1,0 +1,35 @@
+data_dir: data/final_decomp_gap/fold0_goal_topology
+model: cpo
+report_model_name: cpo_oracle_tuple
+seed: 0
+run_name: final_tuple_fold0_cpo_seed0
+train_splits:
+- train_single
+- train_composed_seen
+val_splits:
+- val_single
+- val_composed_seen
+batch_size: 128
+epochs: 30
+lr: 0.001
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
+checkpoint_metric: best_val_tuple_loss
+fold_id: 0
+fold_name: fold0_goal_topology
+heldout_composed_pair_id: 0
+tuple_train_split: train_tuple_seen
+tuple_val_split: val_tuple_seen
+tuple_batch_size: 32
+gate_or_weight: 1.0
+operator_comp_weight: 1.0
+operator_reuse_weight: 0.5
+commutativity_weight: 0.05
+interaction_residual_weight: 0.0

@@ -126,6 +126,51 @@ class GatedERPM(nn.Module):
         self.delta_value_head  = nn.Conv2d(L, 1, 1)
         self.action_delta_head = nn.Conv2d(L, 4, 1)
 
+    def _decode(self, z_updated):
+        return {
+            "future_after": self.future_after_head(z_updated),
+            "value_after": self.value_after_head(z_updated),
+            "delta_future": self.delta_future_head(z_updated),
+            "delta_value": self.delta_value_head(z_updated),
+            "action_delta": self.action_delta_head(z_updated),
+        }
+
+    def decode_from_components(self, z_before, gates, pathway_updates):
+        """Re-decode after an explicit gate+pathway-update intervention."""
+        expected = {"sensory", "value", "map", "action"}
+        missing = sorted(expected - set(pathway_updates))
+        extra = sorted(set(pathway_updates) - expected)
+        if missing or extra:
+            raise ValueError(f"Invalid pathway updates: missing={missing}, extra={extra}")
+        if gates.ndim != 2 or gates.shape[1] != 4:
+            raise ValueError(f"Expected gates [B,4], got {tuple(gates.shape)}")
+        batch = z_before.shape[0]
+        if gates.shape[0] != batch:
+            raise ValueError(f"Gate batch {gates.shape[0]} != latent batch {batch}")
+        for name, update in pathway_updates.items():
+            if update.shape != z_before.shape:
+                raise ValueError(
+                    f"{name} update shape {tuple(update.shape)} != z_before {tuple(z_before.shape)}")
+        g = gates.view(batch, 4, 1, 1)
+        z_update = (
+            g[:, 0:1] * pathway_updates["sensory"]
+            + g[:, 1:2] * pathway_updates["value"]
+            + g[:, 2:3] * pathway_updates["map"]
+            + g[:, 3:4] * pathway_updates["action"]
+        )
+        z_updated = z_before + z_update
+        gate_logits = _safe_logit(gates)
+        return {
+            **self._decode(z_updated),
+            "remap_logits": gate_logits,
+            "gates": gates,
+            "gate_logits": gate_logits,
+            "z_before": z_before,
+            "z_update": z_update,
+            "z_updated": z_updated,
+            "pathway_updates": pathway_updates,
+        }
+
     def forward(self, x, gate_override=None, target_multihot=None):
         B = x.size(0)
         z_before = self.encoder(x[:, :N_GRID])   # [B, L, H, W]
@@ -153,17 +198,16 @@ class GatedERPM(nn.Module):
         u_map     = self.map_head(error_features)
         u_action  = self.action_head(error_features)
 
-        g = final_gates.view(B, 4, 1, 1)
-        z_update  = (g[:, 0:1] * u_sensory + g[:, 1:2] * u_value
-                     + g[:, 2:3] * u_map + g[:, 3:4] * u_action)
-        z_updated = z_before + z_update
+        pathway_updates = {
+            "sensory": u_sensory,
+            "value": u_value,
+            "map": u_map,
+            "action": u_action,
+        }
+        decoded = self.decode_from_components(z_before, final_gates, pathway_updates)
 
         return {
-            "future_after":     self.future_after_head(z_updated),
-            "value_after":      self.value_after_head(z_updated),
-            "delta_future":     self.delta_future_head(z_updated),
-            "delta_value":      self.delta_value_head(z_updated),
-            "action_delta":     self.action_delta_head(z_updated),
+            **decoded,
             "remap_logits":     remap_logits,
             "raw_gate_logits":  raw_gate_logits,
             "raw_gates":        raw_gates,
@@ -171,13 +215,7 @@ class GatedERPM(nn.Module):
             "gate_logits":      final_gate_logits,
             "z_before":         z_before,
             "z_after":          z_after,
-            "z_updated":        z_updated,
-            "pathway_updates": {
-                "sensory": u_sensory,
-                "value":   u_value,
-                "map":     u_map,
-                "action":  u_action,
-            },
+            "pathway_updates": pathway_updates,
         }
 
     def _apply_override(self, raw_gates, mode, target_multihot):

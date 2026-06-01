@@ -1,0 +1,27 @@
+data_dir: data/final_decomp_gap/fold3_sensory_topology
+model: factorized_gates
+report_model_name: independent_gate_heads
+seed: 1
+run_name: final_direct_fold3_independent_gate_heads_seed1
+train_splits:
+- train_single
+- train_composed_seen
+val_splits:
+- val_single
+- val_composed_seen
+batch_size: 128
+epochs: 30
+lr: 0.001
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
+checkpoint_metric: best_val_composed_seen_exact
+fold_id: 3
+fold_name: fold3_sensory_topology
+heldout_composed_pair_id: 3

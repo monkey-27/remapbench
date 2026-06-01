@@ -1,0 +1,27 @@
+data_dir: data/final_decomp_gap/fold1_sensory_action
+model: standard_cnn
+report_model_name: standard
+seed: 0
+run_name: final_direct_fold1_standard_seed0
+train_splits:
+- train_single
+- train_composed_seen
+val_splits:
+- val_single
+- val_composed_seen
+batch_size: 128
+epochs: 30
+lr: 0.001
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0
+checkpoint_metric: best_val_composed_seen_exact
+fold_id: 1
+fold_name: fold1_sensory_action
+heldout_composed_pair_id: 1

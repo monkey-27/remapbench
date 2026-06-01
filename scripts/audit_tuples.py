@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from remapbench.interventions import COMPOSED_PAIRS, INTERVENTION_IDS
+from remapbench.interventions import COMPOSED_PAIRS, INTERVENTION_IDS, apply_intervention
 
 TUPLE_SPLITS = [
     "train_tuple_seen", "val_tuple_seen", "test_tuple_seen", "test_tuple_heldout",
@@ -110,6 +110,7 @@ def audit(data_dir):
             components_a = {_text(data["tuple_component_a"][i]) for i in idxs}
             components_b = {_text(data["tuple_component_b"][i]) for i in idxs}
             replay_orders = {_text(data["tuple_replay_order"][i]) for i in idxs}
+            independent_b = data.get("tuple_b_is_independent_base")
             if len(layout_ids) != 1 or next(iter(layout_ids)) != tuple_id:
                 errors.append(f"{split_name}: tuple {tuple_id} must use one matching layout_id")
             if len(layout_seeds) != 1:
@@ -128,6 +129,8 @@ def audit(data_dir):
                 errors.append(f"{split_name}: tuple {tuple_id} component names do not match pair {pair_id}")
             if replay_orders != {"A_then_B"}:
                 errors.append(f"{split_name}: tuple {tuple_id} is not marked as sequential A_then_B replay")
+            if independent_b is not None and any(int(independent_b[i]) != 1 for i in idxs):
+                errors.append(f"{split_name}: tuple {tuple_id} B donor is not marked independent of A")
             if split_name.endswith("_heldout") and pair_id != heldout_pair_id:
                 errors.append(f"{split_name}: tuple {tuple_id} uses pair {pair_id}, expected heldout pair {heldout_pair_id}")
             if split_name.endswith("_seen") and pair_id == heldout_pair_id:
@@ -144,6 +147,23 @@ def audit(data_dir):
                     errors.append(f"{split_name}: tuple {tuple_id} role {role} does not share the base grid")
 
             a_idx, b_idx, ab_idx = role_to_idx["A"], role_to_idx["B"], role_to_idx["AB"]
+            if independent_b is not None:
+                start_xy = data["start_xy"][base_idx]
+                goal_xy = data["goal_after_xy"][base_idx]
+                start = (int(start_xy[1]), int(start_xy[0]))
+                goal = (int(goal_xy[1]), int(goal_xy[0]))
+                reconstructed_b = apply_intervention(
+                    base_before, start, goal,
+                    np.random.default_rng(int(data["intervention_seed"][b_idx])),
+                    component_b,
+                )
+                reconstructed_grid, reconstructed_goal = reconstructed_b[0], reconstructed_b[1]
+                if not np.array_equal(data["after_grid"][b_idx], reconstructed_grid):
+                    errors.append(f"{split_name}: tuple {tuple_id} B donor is not independent B(base)")
+                stored_goal_xy = data["goal_after_xy"][b_idx]
+                stored_goal = (int(stored_goal_xy[1]), int(stored_goal_xy[0]))
+                if stored_goal != reconstructed_goal:
+                    errors.append(f"{split_name}: tuple {tuple_id} B donor goal is not independent B(base)")
             expected_ids = {
                 "base": -1,
                 "A": INTERVENTION_IDS[component_a],
@@ -168,7 +188,8 @@ def audit(data_dir):
             changed_a = data["after_grid"][a_idx] != base_before
             changed_b = data["tuple_b_replay_mask"][ab_idx].astype(bool)
             expected_grid_ab[changed_a] = data["after_grid"][a_idx][changed_a]
-            expected_grid_ab[changed_b] = data["after_grid"][b_idx][changed_b]
+            replay_values = data.get("tuple_b_replay_values", data["after_grid"])[ab_idx]
+            expected_grid_ab[changed_b] = replay_values[changed_b]
             if not np.array_equal(data["after_grid"][ab_idx], expected_grid_ab):
                 errors.append(f"{split_name}: tuple {tuple_id} AB grid is not the merged A+B counterfactual")
 
