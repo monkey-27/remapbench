@@ -226,6 +226,10 @@ def audit(data_dir):
             requested_n = int(requested_n)
             if requested_n <= 0:
                 continue
+            if "_tuple_" in split_name:
+                # Linked counterfactual tuples have their own strict integrity
+                # and evidence audit in scripts/audit_tuples.py.
+                continue
             actual_n = (len(splits[split_name]["intervention_id"])
                         if split_name in splits else 0)
             frac = actual_n / requested_n

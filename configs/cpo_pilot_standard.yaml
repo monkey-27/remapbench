@@ -1,0 +1,35 @@
+data_dir: data/remapbench_cpo_pilot
+grid_size: 10
+seed: 0
+n_train: 12000
+n_val: 2000
+n_test: 2000
+n_composed: 2000
+n_test_larger: 1000
+n_test_noisy: 1000
+n_train_composed_seen: 4000
+n_val_composed_seen: 1000
+n_test_composed_seen: 1000
+n_test_composed_heldout: 1000
+n_train_tuple_seen: 3000
+n_val_tuple_seen: 500
+n_test_tuple_seen: 500
+n_test_tuple_heldout: 500
+heldout_composed_pair_id: 2
+gamma: 0.95
+batch_size: 128
+epochs: 30
+lr: 0.001
+run_name: cpo_pilot_standard_seed0
+model: standard_cnn
+train_splits: ["train_single", "train_composed_seen"]
+val_splits: ["val_single", "val_composed_seen"]
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 0.0
+value_after_weight: 0.0
+gate_sparsity_weight: 0.0
+stability_weight: 0.0

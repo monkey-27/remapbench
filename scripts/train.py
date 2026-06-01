@@ -167,7 +167,8 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--model",  default=None,
                         choices=["erpm", "standard", "standard_cnn", "gated_erpm",
-                                 "ungated_latent", "global_plasticity", None])
+                                 "ungated_latent", "global_plasticity",
+                                 "factorized_gates", None])
     parser.add_argument("--seed",   type=int, default=0)
     args = parser.parse_args()
 
@@ -175,7 +176,8 @@ def main():
         cfg = yaml.safe_load(f)
 
     model_name = args.model or cfg.get("model", "erpm")
-    is_gated   = model_name in ("gated_erpm", "ungated_latent", "global_plasticity")
+    is_gated   = model_name in (
+        "gated_erpm", "ungated_latent", "global_plasticity", "factorized_gates")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

@@ -1,5 +1,6 @@
 from .erpm import ErrorGatedPredictiveMapCNN, StandardPredictiveMapCNN
 from .gated_erpm import GatedERPM, GlobalPlasticity, UngatedLatent
+from .cpo import CPO, FactorizedGates
 from .baselines import HeuristicBaseline, ALL_BASELINES
 
 __all__ = [
@@ -8,6 +9,8 @@ __all__ = [
     "GatedERPM",
     "UngatedLatent",
     "GlobalPlasticity",
+    "CPO",
+    "FactorizedGates",
     "HeuristicBaseline",
     "ALL_BASELINES",
 ]
@@ -25,7 +28,12 @@ def build_model(name: str, **kwargs):
         return UngatedLatent(**kwargs)
     elif name in ("global_plasticity", "GlobalPlasticity"):
         return GlobalPlasticity(**kwargs)
+    elif name in ("cpo", "cpo_no_comp", "CPO"):
+        return CPO(**kwargs)
+    elif name in ("factorized_gates", "FactorizedGates"):
+        return FactorizedGates(**kwargs)
     else:
         raise ValueError(
             f"Unknown model: {name!r}. Choose from: erpm, standard_cnn, "
-            "gated_erpm, ungated_latent, global_plasticity")
+            "gated_erpm, ungated_latent, global_plasticity, cpo, cpo_no_comp, "
+            "factorized_gates")

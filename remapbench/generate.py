@@ -41,7 +41,6 @@ ORACLE_THRESHOLDS = {
 ACTION_LOCAL_MIN = 0.20
 
 SINGLE_INTERVENTIONS = ["sensory_nuisance", "goal_relocation", "topology_change", "action_change"]
-
 # ---------------------------------------------------------------------------
 # Collision-proof split identity scheme
 # ---------------------------------------------------------------------------
@@ -64,6 +63,10 @@ SPLIT_IDS = {
     "val_composed_seen":     7,
     "test_composed_seen":    8,
     "test_composed_heldout": 9,
+    "train_tuple_seen":     10,
+    "val_tuple_seen":       11,
+    "test_tuple_seen":      12,
+    "test_tuple_heldout":   13,
 }
 
 LAYOUT_ID_STRIDE = 1_000_000_000   # layout_id = split_id * LAYOUT_ID_STRIDE + index
@@ -87,45 +90,7 @@ SEED_OFFSETS = {
 # Core sample generation
 # ---------------------------------------------------------------------------
 
-def _generate_one(
-    layout_seed, intervention_seed, intervention_type, H, W, gamma, cfg,
-    composed_pair_idx=None, sample_id=0, layout_id=0,
-    nuisance_prob=0.15, distractor_prob=0.10,
-):
-    """Generate one sample with fully deterministic, per-sample seeds.
-
-    layout_id is supplied explicitly (collision-proof per-split scheme) and is
-    independent of the retry attempt encoded in layout_seed.
-    """
-    rng_layout = np.random.default_rng(layout_seed)
-    rng_inter  = np.random.default_rng(intervention_seed)
-
-    grid, start, goal, _ = make_grid(
-        H, W, rng_layout,
-        wall_prob=cfg["wall_prob"],
-        min_path=cfg["min_path"],
-        nuisance_prob=nuisance_prob,
-        distractor_prob=distractor_prob,
-    )
-
-    result = apply_intervention(grid, start, goal, rng_inter, intervention_type, composed_pair_idx)
-    g2, g2_goal, iname, multihot, weak, extra_meta = result
-    pair = extra_meta.get("composed_pair")
-    pair_id = COMPOSED_PAIRS.index(pair) if pair in COMPOSED_PAIRS else -1
-
-    iid = INTERVENTION_IDS.get(iname, INTERVENTION_IDS["composed"])
-    sample = build_sample_arrays(
-        grid, g2, start, goal, g2_goal,
-        iid, multihot, gamma,
-        layout_id=layout_id,
-        sample_id=sample_id,
-        layout_seed=layout_seed,
-        intervention_seed=intervention_seed,
-        intervention_pair_id=pair_id,
-        weak_action_change=weak,
-        action_meta=extra_meta,
-    )
-
+def _validate_sample(sample, intervention_type, weak, multihot):
     # Post-hoc oracle threshold check (minimum signal)
     thresholds = ORACLE_THRESHOLDS.get(intervention_type, {})
     for err_key, min_val in thresholds.items():
@@ -191,6 +156,130 @@ def _generate_one(
     return sample
 
 
+def _build_intervention_sample(
+    grid, start, goal, rng_inter, intervention_type, gamma,
+    layout_seed, intervention_seed, sample_id, layout_id,
+    composed_pair_idx=None, intervention_pair_id=None,
+):
+    result = apply_intervention(grid, start, goal, rng_inter, intervention_type, composed_pair_idx)
+    g2, g2_goal, iname, multihot, weak, extra_meta = result
+    pair = extra_meta.get("composed_pair")
+    pair_id = COMPOSED_PAIRS.index(pair) if pair in COMPOSED_PAIRS else -1
+    if intervention_pair_id is not None:
+        pair_id = intervention_pair_id
+    iid = INTERVENTION_IDS.get(iname, INTERVENTION_IDS["composed"])
+    sample = build_sample_arrays(
+        grid, g2, start, goal, g2_goal,
+        iid, multihot, gamma,
+        layout_id=layout_id,
+        sample_id=sample_id,
+        layout_seed=layout_seed,
+        intervention_seed=intervention_seed,
+        intervention_pair_id=pair_id,
+        weak_action_change=weak,
+        action_meta=extra_meta,
+    )
+    return _validate_sample(sample, intervention_type, weak, multihot)
+
+
+def _generate_one(
+    layout_seed, intervention_seed, intervention_type, H, W, gamma, cfg,
+    composed_pair_idx=None, sample_id=0, layout_id=0,
+    nuisance_prob=0.15, distractor_prob=0.10,
+):
+    """Generate one sample with fully deterministic, per-sample seeds."""
+    rng_layout = np.random.default_rng(layout_seed)
+    grid, start, goal, _ = make_grid(
+        H, W, rng_layout,
+        wall_prob=cfg["wall_prob"],
+        min_path=cfg["min_path"],
+        nuisance_prob=nuisance_prob,
+        distractor_prob=distractor_prob,
+    )
+    return _build_intervention_sample(
+        grid, start, goal, np.random.default_rng(intervention_seed),
+        intervention_type, gamma, layout_seed, intervention_seed,
+        sample_id, layout_id, composed_pair_idx=composed_pair_idx,
+    )
+
+
+def _with_tuple_meta(sample, tuple_id, role, pair_id, component_a, component_b,
+                     b_replay_mask):
+    sample.update(
+        tuple_id=np.int64(tuple_id),
+        tuple_role=np.array(role),
+        tuple_role_id=np.int64({"base": 0, "A": 1, "B": 2, "AB": 3}[role]),
+        tuple_pair_id=np.int64(pair_id),
+        tuple_component_a=np.array(component_a),
+        tuple_component_b=np.array(component_b),
+        tuple_replay_order=np.array("A_then_B"),
+        tuple_b_replay_mask=b_replay_mask.astype(np.uint8),
+    )
+    return sample
+
+
+def _generate_tuple_one(
+    layout_seed, intervention_seed, pair_id, H, W, gamma, cfg,
+    tuple_id, sample_id_offset, layout_id,
+    nuisance_prob=0.15, distractor_prob=0.10,
+):
+    """Generate base/A/B/AB rows from one layout for a matched counterfactual tuple."""
+    grid, start, goal, _ = make_grid(
+        H, W, np.random.default_rng(layout_seed),
+        wall_prob=cfg["wall_prob"],
+        min_path=cfg["min_path"],
+        nuisance_prob=nuisance_prob,
+        distractor_prob=distractor_prob,
+    )
+    component_a, component_b = COMPOSED_PAIRS[pair_id]
+    seed_a, seed_b = intervention_seed, intervention_seed + 1
+    base = build_sample_arrays(
+        grid, grid, start, goal, goal, -1, [0, 0, 0, 0], gamma,
+        layout_id=layout_id, sample_id=sample_id_offset,
+        layout_seed=layout_seed, intervention_seed=-1,
+        intervention_pair_id=pair_id,
+    )
+    result_a = apply_intervention(grid, start, goal, np.random.default_rng(seed_a), component_a)
+    g_a, goal_a, _, multihot_a, weak_a, meta_a = result_a
+    result_ab_b = apply_intervention(g_a, start, goal_a, np.random.default_rng(seed_b), component_b)
+    g_ab, goal_ab, _, multihot_b, weak_b, meta_b = result_ab_b
+    changed_b = g_ab != g_a
+    g_b = grid.copy()
+    g_b[changed_b] = g_ab[changed_b]
+    goal_b = goal_ab if goal_ab != goal_a else goal
+    sample_a = _validate_sample(build_sample_arrays(
+        grid, g_a, start, goal, goal_a,
+        INTERVENTION_IDS[component_a], multihot_a, gamma,
+        layout_id=layout_id, sample_id=sample_id_offset + 1,
+        layout_seed=layout_seed, intervention_seed=seed_a,
+        intervention_pair_id=pair_id, weak_action_change=weak_a, action_meta=meta_a,
+    ), component_a, weak_a, multihot_a)
+    sample_b = _validate_sample(build_sample_arrays(
+        grid, g_b, start, goal, goal_b,
+        INTERVENTION_IDS[component_b], multihot_b, gamma,
+        layout_id=layout_id, sample_id=sample_id_offset + 2,
+        layout_seed=layout_seed, intervention_seed=seed_b,
+        intervention_pair_id=pair_id, weak_action_change=weak_b, action_meta=meta_b,
+    ), component_b, weak_b, multihot_b)
+
+    multihot_ab = np.maximum(multihot_a, multihot_b).tolist()
+    action_meta = meta_a if meta_a.get("action_cell_row", -1) != -1 else meta_b
+    sample_ab = _validate_sample(build_sample_arrays(
+        grid, g_ab, start, goal, goal_ab,
+        INTERVENTION_IDS["composed"], multihot_ab, gamma,
+        layout_id=layout_id, sample_id=sample_id_offset + 3,
+        layout_seed=layout_seed, intervention_seed=seed_b,
+        intervention_pair_id=pair_id,
+        weak_action_change=max(weak_a, weak_b), action_meta=action_meta,
+    ), "composed", max(weak_a, weak_b), multihot_ab)
+    return [
+        _with_tuple_meta(base, tuple_id, "base", pair_id, component_a, component_b, changed_b),
+        _with_tuple_meta(sample_a, tuple_id, "A", pair_id, component_a, component_b, changed_b),
+        _with_tuple_meta(sample_b, tuple_id, "B", pair_id, component_a, component_b, changed_b),
+        _with_tuple_meta(sample_ab, tuple_id, "AB", pair_id, component_a, component_b, changed_b),
+    ]
+
+
 def generate_split(
     n, intervention_schedule, split_name, split_id, base_seed, H, W, gamma, cfg, verbose=True,
     composed_pair_schedule=None, global_id_offset=0,
@@ -247,6 +336,42 @@ def generate_split(
     return samples
 
 
+def generate_tuple_split(
+    n, pair_schedule, split_name, split_id, base_seed, H, W, gamma, cfg, verbose=True,
+    global_id_offset=0, nuisance_prob=0.15, distractor_prob=0.10,
+):
+    """Generate n matched tuples; each accepted tuple contributes four linked rows."""
+    samples = []
+    failures = 0
+    stride = cfg["max_sample_tries"]
+    split_base = base_seed + split_id * SPLIT_SEED_STRIDE
+    for i, pair_id in enumerate(pair_schedule):
+        layout_id = split_id * LAYOUT_ID_STRIDE + i
+        tuple_id = layout_id
+        success = False
+        for attempt in range(stride):
+            layout_seed = split_base + i * stride + attempt
+            inter_seed = split_base + ROLE_OFFSET + (i * stride + attempt) * 2
+            try:
+                rows = _generate_tuple_one(
+                    layout_seed, inter_seed, pair_id, H, W, gamma, cfg,
+                    tuple_id, global_id_offset + i * 4, layout_id,
+                    nuisance_prob=nuisance_prob, distractor_prob=distractor_prob,
+                )
+                samples.extend(rows)
+                success = True
+                break
+            except (ValueError, RuntimeError):
+                pass
+        if not success:
+            failures += 1
+            if verbose and failures <= 5:
+                print(f"  [WARN] {split_name}[{i}] (pair={pair_id}): all retries exhausted, skipping")
+    if verbose:
+        print(f"  {split_name}: done — {len(samples) // 4}/{n} tuples, {failures} failures")
+    return samples
+
+
 def _balanced_schedule(n, types, rng):
     per = n // len(types)
     rem = n % len(types)
@@ -298,6 +423,8 @@ def generate_dataset(
     n_test_larger=0, n_test_noisy=0,
     n_train_composed_seen=0, n_val_composed_seen=0,
     n_test_composed_seen=0, n_test_composed_heldout=0,
+    n_train_tuple_seen=0, n_val_tuple_seen=0,
+    n_test_tuple_seen=0, n_test_tuple_heldout=0,
     heldout_composed_pair_id=2,
     gamma=0.95, verbose=True,
 ):
@@ -318,6 +445,7 @@ def generate_dataset(
         pair_id for pair_id in all_pair_ids
         if pair_id != heldout_composed_pair_id
     ]
+    seen_tuple_pair_ids = seen_composed_pair_ids
 
     # (name, n, composed_pair_ids-or-None, H, W, nuisance_prob, distractor_prob)
     spec = [
@@ -356,6 +484,25 @@ def generate_dataset(
         splits[split_name] = samples
         global_id += n
 
+    tuple_spec = [
+        ("train_tuple_seen",   n_train_tuple_seen,   seen_tuple_pair_ids),
+        ("val_tuple_seen",     n_val_tuple_seen,     seen_tuple_pair_ids),
+        ("test_tuple_seen",    n_test_tuple_seen,    seen_tuple_pair_ids),
+        ("test_tuple_heldout", n_test_tuple_heldout, [heldout_composed_pair_id]),
+    ]
+    for split_name, n, pair_ids in tuple_spec:
+        if n <= 0:
+            splits[split_name] = []
+            continue
+        print(f"Generating {split_name} ({n} tuples, grid={H}x{W}, split_id={SPLIT_IDS[split_name]})...")
+        pair_sched = _balanced_pair_schedule(n, pair_ids, master_rng)
+        samples = generate_tuple_split(
+            n, pair_sched, split_name, SPLIT_IDS[split_name], base_seed,
+            H, W, gamma, cfg, verbose, global_id_offset=global_id,
+        )
+        splits[split_name] = samples
+        global_id += n * 4
+
     # Save
     print("Saving splits...")
     for split_name, samples in splits.items():
@@ -368,6 +515,14 @@ def generate_dataset(
         "composed_pairs":     [list(p) for p in COMPOSED_PAIRS],
         "heldout_composed_pair_id": int(heldout_composed_pair_id),
         "seen_composed_pair_ids": [int(x) for x in seen_composed_pair_ids],
+        "tuple_roles": ["base", "A", "B", "AB"],
+        "tuple_heldout_pair_id": int(heldout_composed_pair_id),
+        "tuple_split_pair_ids": {
+            "train_tuple_seen": [int(x) for x in seen_tuple_pair_ids],
+            "val_tuple_seen": [int(x) for x in seen_tuple_pair_ids],
+            "test_tuple_seen": [int(x) for x in seen_tuple_pair_ids],
+            "test_tuple_heldout": [int(heldout_composed_pair_id)],
+        },
         "composed_split_pair_ids": {
             "test_composed": [int(x) for x in all_pair_ids],
             "train_composed_seen": [int(x) for x in seen_composed_pair_ids],
@@ -418,6 +573,16 @@ def generate_dataset(
             "val_composed_seen":     int(n_val_composed_seen),
             "test_composed_seen":    int(n_test_composed_seen),
             "test_composed_heldout": int(n_test_composed_heldout),
+            "train_tuple_seen":   int(n_train_tuple_seen) * 4,
+            "val_tuple_seen":     int(n_val_tuple_seen) * 4,
+            "test_tuple_seen":    int(n_test_tuple_seen) * 4,
+            "test_tuple_heldout": int(n_test_tuple_heldout) * 4,
+        },
+        "requested_tuple_counts": {
+            "train_tuple_seen":   int(n_train_tuple_seen),
+            "val_tuple_seen":     int(n_val_tuple_seen),
+            "test_tuple_seen":    int(n_test_tuple_seen),
+            "test_tuple_heldout": int(n_test_tuple_heldout),
         },
         "min_saved_fraction_recommended": 0.95,
         "split_ids": SPLIT_IDS,
@@ -454,6 +619,10 @@ def main():
     parser.add_argument("--n_val_composed_seen",     type=int, default=0)
     parser.add_argument("--n_test_composed_seen",    type=int, default=0)
     parser.add_argument("--n_test_composed_heldout", type=int, default=0)
+    parser.add_argument("--n_train_tuple_seen",   type=int, default=0)
+    parser.add_argument("--n_val_tuple_seen",     type=int, default=0)
+    parser.add_argument("--n_test_tuple_seen",    type=int, default=0)
+    parser.add_argument("--n_test_tuple_heldout", type=int, default=0)
     parser.add_argument("--heldout_composed_pair_id", type=int, default=2)
     parser.add_argument("--gamma",          type=float, default=0.95)
     args = parser.parse_args()
@@ -466,6 +635,10 @@ def main():
         n_val_composed_seen=args.n_val_composed_seen,
         n_test_composed_seen=args.n_test_composed_seen,
         n_test_composed_heldout=args.n_test_composed_heldout,
+        n_train_tuple_seen=args.n_train_tuple_seen,
+        n_val_tuple_seen=args.n_val_tuple_seen,
+        n_test_tuple_seen=args.n_test_tuple_seen,
+        n_test_tuple_heldout=args.n_test_tuple_heldout,
         heldout_composed_pair_id=args.heldout_composed_pair_id,
         gamma=args.gamma,
     )

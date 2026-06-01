@@ -131,6 +131,9 @@ def validate(data_dir):
                 requested_n = int(requested_n)
                 if requested_n <= 0:
                     continue
+                if name not in splits and "_tuple_" in name:
+                    print(f"  {name:15s} handled by scripts/audit_tuples.py")
+                    continue
                 actual_n = len(splits[name]["intervention_id"]) if name in splits else 0
                 frac = actual_n / requested_n if requested_n else float("nan")
                 print(f"  {name:15s} {actual_n:>6d}/{requested_n:<6d} (fraction {frac:.3f})")

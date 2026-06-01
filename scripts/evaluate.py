@@ -295,6 +295,7 @@ def main():
     has_planning_output = model_name in (
         "erpm", "standard", "standard_cnn",
         "gated_erpm", "ungated_latent", "global_plasticity",
+        "factorized_gates", "cpo", "cpo_no_comp",
     )
 
     device  = get_device(cfg.get("device", "auto"))

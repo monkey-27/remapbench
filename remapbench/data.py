@@ -63,7 +63,7 @@ class RemapDataset(Dataset):
         ve  = float(d["value_error"][idx])
         ae  = float(d["action_error"][idx])
 
-        return {
+        item = {
             "x":               torch.cat([before, after], dim=0),
             "before_grid":     before,
             "after_grid":      after,
@@ -81,4 +81,45 @@ class RemapDataset(Dataset):
             "sample_id":       torch.tensor(int(d["sample_id"][idx]) if "sample_id" in d else idx, dtype=torch.int64),
             "start_xy":        torch.from_numpy(d["start_xy"][idx].astype(np.int64)),
             "goal_after_xy":   torch.from_numpy(d["goal_after_xy"][idx].astype(np.int64)),
+        }
+        if "tuple_id" in d:
+            item.update(
+                tuple_id=torch.tensor(int(d["tuple_id"][idx]), dtype=torch.int64),
+                tuple_role_id=torch.tensor(int(d["tuple_role_id"][idx]), dtype=torch.int64),
+                tuple_pair_id=torch.tensor(int(d["tuple_pair_id"][idx]), dtype=torch.int64),
+            )
+        return item
+
+
+class TupleRemapDataset(Dataset):
+    """Group linked base/A/B/AB rows from a tuple split into one training item."""
+
+    ROLES = {"base": 0, "A": 1, "B": 2, "AB": 3}
+
+    def __init__(self, path):
+        if not HAS_TORCH:
+            raise ImportError("PyTorch is required for TupleRemapDataset.")
+        self.rows = RemapDataset(path)
+        d = self.rows._data
+        if "tuple_id" not in d or "tuple_role_id" not in d:
+            raise ValueError(f"{path} is not a linked tuple split")
+        self._groups = []
+        for tuple_id in sorted(set(int(x) for x in d["tuple_id"])):
+            indices = np.where(d["tuple_id"] == tuple_id)[0]
+            by_role = {int(d["tuple_role_id"][idx]): int(idx) for idx in indices}
+            if set(by_role) != set(self.ROLES.values()):
+                raise ValueError(f"tuple_id={tuple_id} does not contain base/A/B/AB exactly once")
+            self._groups.append((tuple_id, by_role))
+
+    def __len__(self):
+        return len(self._groups)
+
+    def __getitem__(self, idx):
+        tuple_id, by_role = self._groups[idx]
+        return {
+            "tuple_id": torch.tensor(tuple_id, dtype=torch.int64),
+            "base": self.rows[by_role[0]],
+            "A": self.rows[by_role[1]],
+            "B": self.rows[by_role[2]],
+            "AB": self.rows[by_role[3]],
         }
