@@ -19,7 +19,8 @@ from scripts.train import _compute_loss, eval_epoch, get_device, train_epoch
 
 
 GATED_MODELS = {
-    "gated_erpm", "factorized_gates", "fepo_directonly", "fepo_tuple_supervised",
+    "gated_erpm", "decoupled_gated_erpm", "factorized_gates",
+    "fepo_directonly", "fepo_tuple_supervised",
 }
 
 
