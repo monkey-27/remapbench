@@ -1,0 +1,15 @@
+data_dir: data/remapbench_cpo_pilot
+run_name: direction_d2_factorized
+model: factorized_gates
+train_splits: ["train_single", "train_composed_seen"]
+val_splits: ["val_single", "val_composed_seen"]
+epochs: 30
+batch_size: 128
+lr: 0.001
+device: auto
+future_weight: 1.0
+value_weight: 1.0
+action_weight: 1.0
+type_weight: 1.0
+future_after_weight: 1.0
+value_after_weight: 1.0

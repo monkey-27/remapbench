@@ -38,6 +38,8 @@ def build_model(name: str, **kwargs):
         "fepo",
         "fepo_no_evidence_invariance",
         "fepo_no_operator_reuse",
+        "fepo_directonly",
+        "fepo_tuple_supervised",
         "FEPO",
     ):
         return FEPO(**kwargs)
@@ -46,4 +48,4 @@ def build_model(name: str, **kwargs):
             f"Unknown model: {name!r}. Choose from: erpm, standard_cnn, "
             "gated_erpm, ungated_latent, global_plasticity, cpo, cpo_no_comp, "
             "factorized_gates, fepo, fepo_no_evidence_invariance, "
-            "fepo_no_operator_reuse")
+            "fepo_no_operator_reuse, fepo_directonly, fepo_tuple_supervised")

@@ -296,6 +296,7 @@ def main():
         "erpm", "standard", "standard_cnn",
         "gated_erpm", "ungated_latent", "global_plasticity",
         "factorized_gates", "cpo", "cpo_no_comp",
+        "fepo", "fepo_directonly", "fepo_tuple_supervised",
     )
 
     device  = get_device(cfg.get("device", "auto"))
