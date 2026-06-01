@@ -1,0 +1,16 @@
+data_dir: data/remapbench_v1_composed
+run_name: c3_d1_full_reconstruction
+model: c3_full_reconstruction
+train_splits:
+- train_single
+- train_composed_seen
+val_splits:
+- val_single
+- val_composed_seen
+epochs: 30
+batch_size: 128
+lr: 0.001
+device: auto
+latent_channels: 32
+sparsity_weight: 0.001
+energy_scale: 100.0

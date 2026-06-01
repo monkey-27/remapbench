@@ -3,6 +3,7 @@ from .gated_erpm import GatedERPM, GlobalPlasticity, UngatedLatent
 from .decoupled_gated_erpm import DecoupledGatedERPM
 from .cpo import CPO, FactorizedGates
 from .fepo import FEPO
+from .c3 import CounterfactualCauseComposer, build_c3
 from .baselines import HeuristicBaseline, ALL_BASELINES
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "CPO",
     "FactorizedGates",
     "FEPO",
+    "CounterfactualCauseComposer",
     "HeuristicBaseline",
     "ALL_BASELINES",
 ]
@@ -47,9 +49,12 @@ def build_model(name: str, **kwargs):
         "FEPO",
     ):
         return FEPO(**kwargs)
+    elif name.startswith("c3_"):
+        return build_c3(name, **kwargs)
     else:
         raise ValueError(
             f"Unknown model: {name!r}. Choose from: erpm, standard_cnn, "
             "gated_erpm, decoupled_gated_erpm, ungated_latent, global_plasticity, cpo, cpo_no_comp, "
             "factorized_gates, fepo, fepo_no_evidence_invariance, "
-            "fepo_no_operator_reuse, fepo_directonly, fepo_tuple_supervised")
+            "fepo_no_operator_reuse, fepo_directonly, fepo_tuple_supervised, "
+            "c3_full_reconstruction, c3_delta_space, c3_factor_scored")
