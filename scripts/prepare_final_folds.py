@@ -81,10 +81,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--fold-id", type=int, choices=range(len(FOLDS)))
+    parser.add_argument("--seen-upper-bound-only", action="store_true")
     parser.add_argument("--out", default="data/final_decomp_gap")
     args = parser.parse_args()
+    if args.fold_id is not None and args.seen_upper_bound_only:
+        parser.error("--fold-id and --seen-upper-bound-only are mutually exclusive")
     counts = SMOKE_COUNTS if args.smoke else FULL_COUNTS
-    folds = [FOLDS[2]] if args.smoke else FOLDS
+    folds = [FOLDS[args.fold_id]] if args.fold_id is not None else (
+        [FOLDS[2]] if args.smoke else ([] if args.seen_upper_bound_only else FOLDS))
     for fold in folds:
         root = Path(args.out) if args.smoke else Path(args.out) / fold["fold_name"]
         action = "would generate/audit" if args.dry_run else "generating/auditing"
@@ -94,7 +99,7 @@ def main():
         if not args.dry_run:
             manifest = _run_fold(root, fold, counts)
             print(json.dumps(manifest, indent=2))
-    if not args.smoke:
+    if not args.smoke and args.fold_id is None:
         root = Path(args.out) / "seen_upper_bound"
         action = "would generate/audit" if args.dry_run else "generating/auditing"
         print(f"{action}: seen_upper_bound include_all_composed_pairs_train=True -> {root}")
