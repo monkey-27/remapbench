@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from models import build_model
 from remapbench.data import RemapDataset
@@ -23,6 +23,22 @@ GATED_MODELS = {
 }
 
 
+class OrdinaryRows(Dataset):
+    """Present tuple rows as ordinary direct-supervision examples."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        row = dict(self.dataset[idx])
+        for key in ("tuple_id", "tuple_role_id", "tuple_pair_id"):
+            row.pop(key, None)
+        return row
+
+
 def _datasets(data_dir, names, skip_missing=False):
     parts, used, skipped = [], [], []
     for name in names:
@@ -32,7 +48,7 @@ def _datasets(data_dir, names, skip_missing=False):
                 skipped.append(name)
                 continue
             raise FileNotFoundError(path)
-        parts.append(RemapDataset(path))
+        parts.append(OrdinaryRows(RemapDataset(path)))
         used.append(name)
     if not parts:
         raise ValueError("No datasets selected")
@@ -89,7 +105,7 @@ def main():
     print(f"Device: {device} | Model: {model_name} | train={used_train} | skipped={skipped}")
     print(f"Train samples={len(train_ds)} | val samples={len(val_ds)}")
 
-    best_loss, best_exact = float("inf"), -1.0
+    best_loss, best_exact, best_exact_loss = float("inf"), -1.0, float("inf")
     with open(os.path.join(run_dir, "train_log.jsonl"), "w") as log:
         for epoch in range(1, cfg.get("epochs", 30) + 1):
             started = time.time()
@@ -102,8 +118,11 @@ def main():
             if val_loss < best_loss:
                 best_loss = val_loss
                 torch.save(ckpt, os.path.join(run_dir, "best_val_sample_loss.pt"))
-            if composed_exact > best_exact:
+            if composed_exact > best_exact or (
+                composed_exact == best_exact and val_loss < best_exact_loss
+            ):
                 best_exact = composed_exact
+                best_exact_loss = val_loss
                 torch.save(ckpt, os.path.join(run_dir, "best_val_composed_seen_exact.pt"))
             row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
                    "val_composed_seen_exact": composed_exact, **f1, **comps}

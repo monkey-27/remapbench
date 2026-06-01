@@ -59,6 +59,10 @@ def _per_pathway(terms):
     return {name: _mean_or_none(values) for name, values in terms.items()}
 
 
+def _sigmoid(logits):
+    return 1.0 / (1.0 + np.exp(-np.clip(logits, -60.0, 60.0)))
+
+
 def _add_reuse_terms(terms, direct, single, targets):
     direct_updates = _pathway_values(direct, ("pathway_updates",))
     single_updates = _pathway_values(single, ("pathway_updates",))
@@ -148,14 +152,19 @@ def evaluate_tuple(model, loader, device, threshold):
     composed, direct = _concat(composed_store), _concat(direct_store)
     single_a, single_b = _concat(a_store), _concat(b_store)
     truth = {key: np.concatenate(value, axis=0) for key, value in truths.items()}
-    probs = 1.0 / (1.0 + np.exp(-direct["remap_logits"]))
-    probs_a = 1.0 / (1.0 + np.exp(-single_a["remap_logits"]))
-    probs_b = 1.0 / (1.0 + np.exp(-single_b["remap_logits"]))
+    probs = _sigmoid(direct["remap_logits"])
+    composed_probs = _sigmoid(composed["remap_logits"])
+    probs_a = _sigmoid(single_a["remap_logits"])
+    probs_b = _sigmoid(single_b["remap_logits"])
     predicted_or = np.logical_or(probs_a > threshold, probs_b > threshold)
 
     overall = compute_multilabel_metrics(probs, truth["target_multihot"], threshold)
     overall.update({f"{key}_mse": compute_map_mse(direct[key], truth[key])
                     for key in ("delta_future", "delta_value", "action_delta")})
+    composed_overall = compute_multilabel_metrics(
+        composed_probs, truth["target_multihot"], threshold)
+    composed_overall.update({f"{key}_mse": compute_map_mse(composed[key], truth[key])
+                             for key in ("delta_future", "delta_value", "action_delta")})
     diagnostics = {
         "evidence_invariance_error": _mean_terms(invariance_terms) if evidence_available else None,
         "evidence_invariance_error_by_pathway": (
@@ -171,7 +180,12 @@ def evaluate_tuple(model, loader, device, threshold):
         composed, direct, ("z_updated", "delta_future", "delta_value", "action_delta"))
     if composition_mse:
         diagnostics["operator_composition_error"] = composition_mse
-    return {"kind": "tuple", "overall": overall, "fepo_diagnostics": diagnostics}
+    return {
+        "kind": "tuple",
+        "overall": overall,
+        "tuple_composed_overall": composed_overall,
+        "fepo_diagnostics": diagnostics,
+    }
 
 
 def main():
