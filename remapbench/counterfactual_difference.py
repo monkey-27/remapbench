@@ -1,4 +1,4 @@
-"""Datasets and diagnostics for counterfactual difference training."""
+"""Datasets and diagnostics for primitive evidence-mask training."""
 import os
 
 import numpy as np
@@ -105,8 +105,15 @@ class CounterfactualTransitionDataset(Dataset):
         if self.is_tuple:
             return self.source[source_idx][role]
         row = self.source[source_idx]
-        before = {"after_grid": row["before_grid"], "layout_id": row["layout_id"], "sample_id": row["sample_id"]}
-        after = {"after_grid": row["after_grid"], "layout_id": row["layout_id"], "sample_id": row["sample_id"]}
+        pair_id = row.get("intervention_pair_id", torch.tensor(-1, dtype=torch.int64))
+        before = {
+            "after_grid": row["before_grid"], "layout_id": row["layout_id"],
+            "sample_id": row["sample_id"], "tuple_pair_id": pair_id,
+        }
+        after = {
+            "after_grid": row["after_grid"], "layout_id": row["layout_id"],
+            "sample_id": row["sample_id"], "tuple_pair_id": pair_id,
+        }
         return transition(before, after, row["target_multihot"], "base_to_AB")
 
 

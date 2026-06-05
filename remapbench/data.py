@@ -82,6 +82,8 @@ class RemapDataset(Dataset):
             "start_xy":        torch.from_numpy(d["start_xy"][idx].astype(np.int64)),
             "goal_after_xy":   torch.from_numpy(d["goal_after_xy"][idx].astype(np.int64)),
         }
+        if "intervention_pair_id" in d:
+            item["intervention_pair_id"] = torch.tensor(int(d["intervention_pair_id"][idx]), dtype=torch.int64)
         if "tuple_id" in d:
             item.update(
                 tuple_id=torch.tensor(int(d["tuple_id"][idx]), dtype=torch.int64),

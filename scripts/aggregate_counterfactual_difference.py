@@ -1,4 +1,4 @@
-"""Aggregate local CDT pilot outputs."""
+"""Aggregate local evidence-mask pilot outputs."""
 import argparse
 import csv
 import json
@@ -28,20 +28,38 @@ def row_for(run_dir):
     if not report:
         return None
     heldout = report["split_metrics"].get("test_composed_heldout", {})
+    seen = report["split_metrics"].get("test_composed_seen", {})
+    single = report["split_metrics"].get("test_single", {})
     tuple_metrics = report["split_metrics"].get("test_tuple_heldout_transitions", {})
-    oracle = report["primitive_oracle"].get("test_composed_heldout", {})
+    legacy_rule_key = "primitive_" + "oracle"
+    rule_block = report.get("primitive_diff_rule", report.get(legacy_rule_key, {}))
+    rule = rule_block.get("test_composed_heldout", {})
     context = report.get("context_diagnostics", {})
+    primitive_mask = heldout.get("primitive_mask", {})
+    dice_values = [
+        row.get("dice") for row in primitive_mask.values()
+        if isinstance(row, dict) and row.get("dice") is not None
+    ]
+    variant = str(report.get("report_model_name") or run_dir.name)
+    variant = variant.replace("counterfactual_difference_", "")
+    variant = variant.replace("evidence_mask_", "")
+    variant = variant.replace("bce_plus_masks", "bce_mask")
+    variant = variant.replace("full", "bce_mask_inactive_context")
     return {
         "run_name": run_dir.name,
         "fold_name": report.get("fold_name"),
+        "variant": variant,
         "model": report.get("report_model_name"),
         "seed": report.get("seed"),
         "audit_status": audit.get("status") if audit else None,
         "audit_warnings": len(audit.get("warnings", [])) if audit else None,
         "heldout_exact": heldout.get("exact_match"),
+        "seen_exact": seen.get("exact_match"),
+        "single_exact": single.get("exact_match"),
         "heldout_macro_f1": heldout.get("macro_f1"),
         "tuple_transition_exact": tuple_metrics.get("exact_match"),
-        "primitive_oracle_exact": oracle.get("exact_match"),
+        "primitive_diff_rule_exact": rule.get("exact_match"),
+        "mask_dice_mean": sum(dice_values) / len(dice_values) if dice_values else None,
         "inactive_evidence": heldout.get("inactive_evidence_magnitude"),
         "symmetric_ba_available": context.get("symmetric_ba_available"),
         "context_gap_by_cause": context.get("context_gap_by_cause"),
@@ -53,29 +71,71 @@ def main():
     parser.add_argument("--results-root", default="results")
     args = parser.parse_args()
     root = Path(args.results_root)
-    rows = [row for row in (row_for(path) for path in sorted(root.glob("cdt_*"))) if row]
-    trusted = [row for row in rows if row["audit_status"] in (None, "pass")]
+    run_dirs = sorted(set(root.glob("evidence_mask_*")) | set(root.glob("cdt_*")))
+    rows = [row for row in (row_for(path) for path in run_dirs) if row]
+    trusted = [
+        row for row in rows
+        if row["audit_status"] == "pass" and "smoke" not in row["run_name"]
+    ]
+    unique = {}
+    for row in trusted:
+        key = (row["fold_name"], row["variant"], row["seed"])
+        old = unique.get(key)
+        if old is None or row["run_name"].startswith("evidence_mask_"):
+            unique[key] = row
+    trusted_unique = list(unique.values())
+    grouped = {}
+    for row in trusted_unique:
+        key = row["variant"]
+        grouped.setdefault(key, []).append(row["heldout_exact"])
+    by_variant = {
+        key: {
+            "n": len([v for v in values if v is not None]),
+            "mean_heldout_exact": (
+                sum(v for v in values if v is not None) / len([v for v in values if v is not None])
+                if any(v is not None for v in values) else None
+            ),
+        }
+        for key, values in sorted(grouped.items())
+    }
+    disagreement = {}
+    for run in run_dirs:
+        audit = _read(run / "primitive_diff_rule_audit.json")
+        if audit:
+            disagreement[run.name] = audit
     summary = {
         "status": "complete",
         "baseline_comparison_constants": BASELINES,
         "rows": rows,
         "trusted_rows": trusted,
+        "trusted_unique_rows": trusted_unique,
+        "by_variant": by_variant,
         "decision_note": (
-            "Promising local pilot if high heldout rows have audit_status pass; "
-            "not fully convincing until BA symmetry and all four audited folds are available."
+            "Evidence-mask supervision is the main method. Context/CDT should stay an ablation "
+            "unless it adds robust heldout gains across audited folds."
         ),
     }
-    write_json(root / "cdt_pilot_summary.json", summary)
-    csv_path = root / "cdt_pilot_summary.csv"
+    write_json(root / "evidence_mask_pilot_summary.json", summary)
+    write_json(root / "evidence_mask_disagreement_report.json", {
+        "note": "primitive_diff_rule is a rule baseline from primitive channel diffs, not an oracle for target labels.",
+        "runs": disagreement,
+    })
+    csv_path = root / "evidence_mask_pilot_summary.csv"
     if rows:
         with csv_path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-    lines = ["Counterfactual difference pilot", "", "Baselines", json.dumps(BASELINES, sort_keys=True), "", "Runs"]
+    lines = [
+        "Evidence-mask pilot",
+        "",
+        "primitive_diff_rule is a rule baseline from primitive channel diffs, not an oracle for target labels.",
+        "",
+        "Baselines", json.dumps(BASELINES, sort_keys=True), "", "Runs",
+    ]
     lines.extend(json.dumps(row, sort_keys=True) for row in rows)
-    (root / "cdt_pilot_tables.txt").write_text("\n".join(lines) + "\n")
-    print(f"Aggregated {len(rows)} CDT runs -> {root / 'cdt_pilot_summary.json'}")
+    (root / "evidence_mask_pilot_tables.txt").write_text("\n".join(lines) + "\n")
+    print(f"Aggregated {len(rows)} evidence-mask runs -> {root / 'evidence_mask_pilot_summary.json'}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Audit tuple and primitive-mask assumptions for CDT."""
+"""Audit tuple and primitive-mask assumptions for evidence-mask training."""
 import argparse
 import json
 import os
@@ -10,7 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from remapbench.counterfactual_difference import CAUSES, CounterfactualTransitionDataset, split_path
+from remapbench.counterfactual_difference import (
+    CAUSES, PRIMITIVE_CHANNELS, ROLE_TO_ID, CounterfactualTransitionDataset, split_path,
+)
 from scripts.evaluate import compute_multilabel_metrics
 from scripts.final_common import load_config, write_json
 
@@ -19,6 +21,7 @@ REQUIRED_TUPLE_KEYS = {
     "tuple_id", "tuple_role", "tuple_role_id", "tuple_pair_id",
     "tuple_component_a", "tuple_component_b", "tuple_replay_order",
 }
+ID_TO_ROLE = {value: key for key, value in ROLE_TO_ID.items()}
 
 
 def _text(value):
@@ -38,7 +41,8 @@ def _split_ids(path):
         return {"layout_id": set(), "sample_id": set(), "tuple_id": set(), "error": repr(exc)}
 
 
-def primitive_oracle(path):
+def primitive_diff_rule(path):
+    """Rule baseline from primitive channel diffs, not an oracle for target labels."""
     ds = CounterfactualTransitionDataset(path)
     preds, targets = [], []
     role_counts = Counter()
@@ -61,6 +65,75 @@ def primitive_oracle(path):
         "role_counts": dict(role_counts),
         "active_mask_nonzero_rate": {k: float(np.mean(v)) if v else None for k, v in mask_active.items()},
         "inactive_mask_nonzero_rate": {k: float(np.mean(v)) if v else None for k, v in inactive_leak.items()},
+    }
+
+
+def _as_int(value):
+    if hasattr(value, "item"):
+        return int(value.item())
+    return int(value)
+
+
+def _bits(values):
+    return "".join(str(int(x)) for x in values)
+
+
+def primitive_diff_rule_disagreement(path, split, max_examples=20):
+    ds = CounterfactualTransitionDataset(path)
+    by_cause = {cause: Counter() for cause in CAUSES}
+    by_role = defaultdict(Counter)
+    by_pair = defaultdict(Counter)
+    subset_confusion = Counter()
+    examples = []
+    for idx in range(len(ds)):
+        item = ds[idx]
+        target = item["target_multihot"].numpy().astype(int)
+        masks = item["primitive_masks"]
+        mask_sums = masks.flatten(1).sum(dim=1).numpy()
+        pred = (mask_sums > 0).astype(int)
+        raw_diff = (item["after_grid"] - item["before_grid"]).abs()
+        channel_group_sums = {
+            CAUSES[cause_idx]: float(raw_diff[list(channels)].sum().item())
+            for cause_idx, channels in PRIMITIVE_CHANNELS.items()
+        }
+        role_id = _as_int(item["transition_role_id"])
+        role = ID_TO_ROLE.get(role_id, str(role_id))
+        pair_id = _as_int(item["pair_id"])
+        subset_confusion[f"{_bits(target)}->{_bits(pred)}"] += 1
+        for cause_idx, cause in enumerate(CAUSES):
+            active_mask_zero = int(target[cause_idx] == 1 and pred[cause_idx] == 0)
+            inactive_mask_active = int(target[cause_idx] == 0 and pred[cause_idx] == 1)
+            by_cause[cause]["n"] += 1
+            by_cause[cause]["target_active_mask_inactive"] += active_mask_zero
+            by_cause[cause]["target_inactive_mask_active"] += inactive_mask_active
+            by_cause[cause]["active_mask_nonzero"] += int(target[cause_idx] == 1 and pred[cause_idx] == 1)
+            by_cause[cause]["inactive_mask_nonzero"] += inactive_mask_active
+            by_role[role][f"{cause}_target_active_mask_inactive"] += active_mask_zero
+            by_role[role][f"{cause}_target_inactive_mask_active"] += inactive_mask_active
+            by_pair[str(pair_id)][f"{cause}_target_active_mask_inactive"] += active_mask_zero
+            by_pair[str(pair_id)][f"{cause}_target_inactive_mask_active"] += inactive_mask_active
+        if (target != pred).any() and len(examples) < max_examples:
+            examples.append({
+                "row_index": idx,
+                "sample_id": _as_int(item["sample_id"]),
+                "tuple_id": _as_int(item["tuple_id"]),
+                "pair_id": pair_id,
+                "transition_role": role,
+                "target_multihot": target.tolist(),
+                "primitive_diff_rule_prediction": pred.tolist(),
+                "primitive_mask_sums": {cause: float(mask_sums[i]) for i, cause in enumerate(CAUSES)},
+                "channel_group_raw_diff_sums": channel_group_sums,
+            })
+    metrics = primitive_diff_rule(path)["metrics"]
+    return {
+        "split": split,
+        "n_transitions": len(ds),
+        "primitive_diff_rule": metrics,
+        "subset_confusion": dict(subset_confusion),
+        "by_cause": {cause: dict(counter) for cause, counter in by_cause.items()},
+        "by_transition_role": {role: dict(counter) for role, counter in by_role.items()},
+        "by_pair_id": {pair: dict(counter) for pair, counter in by_pair.items()},
+        "failure_examples": examples,
     }
 
 
@@ -133,10 +206,24 @@ def main():
             if overlap:
                 errors.append(f"layout leakage {left}/{right}: {len(overlap)} overlaps")
     primitive = {
-        split: primitive_oracle(split_path(data_dir, split))
+        split: primitive_diff_rule(split_path(data_dir, split))
         for split in ("train_tuple_seen", "test_tuple_heldout", "test_composed_heldout")
         if os.path.exists(split_path(data_dir, split))
     }
+    disagreement = {}
+    failure_examples = {}
+    for split in ("train_tuple_seen", "val_tuple_seen", "test_tuple_seen",
+                  "test_tuple_heldout", "test_single", "test_composed_seen",
+                  "test_composed_heldout"):
+        path = split_path(data_dir, split)
+        if os.path.exists(path):
+            try:
+                row = primitive_diff_rule_disagreement(path, split)
+                disagreement[split] = {key: value for key, value in row.items()
+                                       if key != "failure_examples"}
+                failure_examples[split] = row["failure_examples"]
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                disagreement[split] = {"status": "failed", "error": repr(exc)}
     label_balance = {}
     for split in ("train_tuple_seen", "test_tuple_heldout"):
         path = split_path(data_dir, split)
@@ -150,12 +237,19 @@ def main():
         "warnings": sorted(set(warnings)),
         "tuple_reports": tuple_reports,
         "split_layout_overlap_counts": leakage,
-        "primitive_oracle": primitive,
+        "primitive_diff_rule": primitive,
+        "primitive_diff_rule_disagreement": disagreement,
         "label_balance": label_balance,
     }
     out = args.out or os.path.join("results", cfg["run_name"], "audit_counterfactual_difference.json")
     write_json(out, report)
-    print(f"CDT audit {report['status']} errors={len(errors)} warnings={len(report['warnings'])} -> {out}")
+    run_dir = os.path.dirname(out)
+    write_json(os.path.join(run_dir, "primitive_diff_rule_audit.json"), {
+        "note": "primitive_diff_rule is a rule baseline from primitive channel diffs, not an oracle for target labels.",
+        "splits": disagreement,
+    })
+    write_json(os.path.join(run_dir, "primitive_diff_rule_failure_examples.json"), failure_examples)
+    print(f"Evidence-mask audit {report['status']} errors={len(errors)} warnings={len(report['warnings'])} -> {out}")
     if errors:
         raise SystemExit(1)
 

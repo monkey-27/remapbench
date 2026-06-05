@@ -1,4 +1,4 @@
-"""Train DiffCauseNet with counterfactual difference losses."""
+"""Train DiffCauseNet with primitive evidence-mask and optional context losses."""
 import argparse
 import json
 import os
@@ -159,9 +159,10 @@ def main():
     np.random.seed(seed)
     device = get_device(cfg.get("device", "auto"))
     model = build_model(
-        "counterfactual_difference",
+        cfg.get("model", "evidence_mask"),
         hidden_channels=cfg.get("hidden_channels", 48),
         use_diff_channels=cfg.get("use_diff_channels", True),
+        label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-4))
     train_ds = CounterfactualTupleDataset(split_path(cfg["data_dir"], cfg.get("tuple_train_split", "train_tuple_seen")), args.max_tuples)
@@ -186,8 +187,8 @@ def main():
             log.flush()
             checkpoint = {
                 **metadata, "epoch": epoch, "model_state": model.state_dict(),
-                "model_name": "counterfactual_difference",
-                "report_model_name": cfg.get("report_model_name", "counterfactual_difference"),
+                "model_name": cfg.get("model", "evidence_mask"),
+                "report_model_name": cfg.get("report_model_name", "evidence_mask"),
                 "config": cfg, "seed": seed, "fold_id": cfg.get("fold_id"),
                 "heldout_composed_pair_id": cfg.get("heldout_composed_pair_id"),
                 "val_metrics": row,
@@ -204,8 +205,8 @@ def main():
         "checkpoint_metric_value": best_exact,
     })
     write_json(os.path.join(run_dir, "manifest.json"), {
-        **metadata, "status": "complete", "method": "counterfactual_difference",
-        "loss_name": "context_difference_loss",
+        **metadata, "status": "complete", "method": cfg.get("method", "evidence_mask"),
+        "loss_name": cfg.get("loss_name", "primitive_mask_loss"),
         "causes": CAUSES, "heldout_pair_names": pair_names(cfg["heldout_composed_pair_id"]),
         "checkpoint_paths": {"last": "last.pt", "best_val_composed_seen_exact": "best_val_composed_seen_exact.pt"},
     })

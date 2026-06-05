@@ -1,4 +1,4 @@
-"""Evaluate counterfactual-difference cause prediction and diagnostics."""
+"""Evaluate primitive evidence-mask cause prediction and diagnostics."""
 import argparse
 import json
 import os
@@ -116,7 +116,8 @@ def context_diagnostics(model, path, cfg, device):
     }
 
 
-def primitive_oracle(path):
+def primitive_diff_rule(path):
+    """Rule baseline from primitive channel diffs, not an oracle for target labels."""
     ds = CounterfactualTransitionDataset(path)
     preds, targets = [], []
     for item in ds:
@@ -136,9 +137,10 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     validate_checkpoint(cfg, checkpoint)
     model = build_model(
-        "counterfactual_difference",
+        cfg.get("model", "evidence_mask"),
         hidden_channels=cfg.get("hidden_channels", 48),
         use_diff_channels=cfg.get("use_diff_channels", True),
+        label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     splits = {}
@@ -157,29 +159,29 @@ def main():
     primitive = {}
     for split in ("test_composed_heldout",):
         try:
-            primitive[split] = primitive_oracle(split_path(cfg["data_dir"], split))
+            primitive[split] = primitive_diff_rule(split_path(cfg["data_dir"], split))
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             primitive[split] = {"status": "failed", "error": repr(exc)}
     try:
-        primitive["test_tuple_heldout_transitions"] = primitive_oracle(tuple_path)
+        primitive["test_tuple_heldout_transitions"] = primitive_diff_rule(tuple_path)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         primitive["test_tuple_heldout_transitions"] = {"status": "failed", "error": repr(exc)}
     report = {
         **common_metadata(cfg, args.config), "status": "complete",
         "checkpoint_used": args.checkpoint, "split_metrics": splits,
         "context_diagnostics": diagnostics,
-        "primitive_oracle": primitive,
+        "primitive_diff_rule": primitive,
     }
     output = args.output or os.path.join("results", cfg["run_name"], "eval_counterfactual_difference.json")
     write_json(output, report)
     write_json(os.path.join("results", cfg["run_name"], "context_diagnostics.json"), diagnostics)
     heldout = splits["test_composed_heldout"]
-    oracle = report["primitive_oracle"]["test_composed_heldout"]
+    rule = report["primitive_diff_rule"]["test_composed_heldout"]
     if heldout.get("status") == "failed":
         print(f"heldout failed: {heldout['error']}")
     else:
         print(f"heldout exact={heldout['exact_match']:.3f} macro={heldout['macro_f1']:.3f} "
-              f"primitive_oracle={oracle.get('exact_match')}")
+              f"primitive_diff_rule={rule.get('exact_match')}")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,22 @@
-"""Compact counterfactual-difference cause detector."""
+"""Compact primitive-evidence cause detector."""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class DiffCauseNet(nn.Module):
     """Small CNN over before/after/diff channels with per-cause evidence maps."""
 
-    def __init__(self, in_channels=10, hidden_channels=48, use_diff_channels=True):
+    def __init__(
+        self,
+        in_channels=10,
+        hidden_channels=48,
+        use_diff_channels=True,
+        label_from_evidence_pool=False,
+    ):
         super().__init__()
         self.in_channels = in_channels
         self.use_diff_channels = use_diff_channels
+        self.label_from_evidence_pool = label_from_evidence_pool
         model_channels = in_channels * (4 if use_diff_channels else 2)
         self.encoder = nn.Sequential(
             nn.Conv2d(model_channels, hidden_channels, 3, padding=1),
@@ -39,6 +45,20 @@ class DiffCauseNet(nn.Module):
         features = self.encoder(self._input(x, before_grid, after_grid))
         evidence_logits = self.evidence_head(features)
         evidence_maps = torch.sigmoid(evidence_logits)
+        if self.label_from_evidence_pool:
+            logits = evidence_logits.flatten(2).amax(dim=2)
+            vectors = []
+            for k in range(4):
+                weights = evidence_maps[:, k:k + 1]
+                denom = weights.sum(dim=(2, 3), keepdim=True).clamp_min(1e-4)
+                vectors.append(((features * weights).sum(dim=(2, 3), keepdim=True) / denom).flatten(1))
+            return {
+                "cause_logits": logits,
+                "remap_logits": logits,
+                "evidence_maps": evidence_maps,
+                "evidence_logits": evidence_logits,
+                "evidence_vectors": torch.stack(vectors, dim=1),
+            }
         vectors = []
         logits = []
         for k, classifier in enumerate(self.classifiers):
@@ -58,3 +78,4 @@ class DiffCauseNet(nn.Module):
 
 
 CounterfactualDifferenceModel = DiffCauseNet
+EvidenceMaskCauseNet = DiffCauseNet
