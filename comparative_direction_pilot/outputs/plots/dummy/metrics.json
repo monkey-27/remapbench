@@ -1,0 +1,31 @@
+{
+  "ambiguous_accuracy": NaN,
+  "direction_formula_given_accuracy": 1.0,
+  "direction_implicit_accuracy": 1.0,
+  "inverse_relation_accuracy": 1.0,
+  "n_rows": 18,
+  "nonlinear_accuracy": 1.0,
+  "numeric_accuracy": 1.0,
+  "numeric_direction_gap": 0.0,
+  "per_domain_accuracy": {
+    "economics_finance": 1.0,
+    "physics": 1.0,
+    "statistics_probability": 1.0
+  },
+  "per_prompt_type_accuracy": {
+    "direction_formula_given": 1.0,
+    "direction_implicit": 1.0,
+    "numeric_solve": 1.0
+  },
+  "per_relation_type_accuracy": {
+    "direct_negative": 1.0,
+    "inverse": 1.0,
+    "nonlinear": 1.0
+  },
+  "product_accuracy": NaN,
+  "relation_type_distribution": {
+    "direct_negative": 3,
+    "inverse": 9,
+    "nonlinear": 6
+  }
+}

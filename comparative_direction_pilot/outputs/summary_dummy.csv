@@ -1,0 +1,4 @@
+prompt_type,n,accuracy
+direction_formula_given,6,1.0
+direction_implicit,6,1.0
+numeric_solve,6,1.0
