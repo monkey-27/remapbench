@@ -29,17 +29,27 @@ def _to_device(value, device):
     return value
 
 
-def _dice_loss(pred, target, eps=1e-5):
+def _dice_loss(pred, target, eps=1e-5, reduction="mean"):
     dims = (2, 3)
     inter = (pred * target).sum(dim=dims)
     denom = pred.sum(dim=dims) + target.sum(dim=dims)
-    return (1.0 - (2.0 * inter + eps) / (denom + eps)).mean()
+    loss = 1.0 - (2.0 * inter + eps) / (denom + eps)
+    return loss.mean() if reduction == "mean" else loss
 
 
-def _mask_loss(out, batch):
+def _mask_loss(out, batch, cfg):
     target = batch["primitive_masks"]
-    bce = F.binary_cross_entropy(out["evidence_maps"], target)
-    return bce + _dice_loss(out["evidence_maps"], target)
+    bce = F.binary_cross_entropy(out["evidence_maps"], target, reduction="none").mean(dim=(2, 3))
+    dice = _dice_loss(out["evidence_maps"], target, reduction="none")
+    loss = bce + dice
+    if cfg.get("conflict_aware_mask_loss", False):
+        labels = batch["target_multihot"]
+        mask_nonzero = target.flatten(2).sum(dim=2) > 0
+        conflict = ((labels > 0.5) & ~mask_nonzero) | ((labels <= 0.5) & mask_nonzero)
+        downweight = float(cfg.get("conflict_mask_downweight", 0.1))
+        weights = torch.where(conflict, torch.full_like(loss, downweight), torch.ones_like(loss))
+        return (loss * weights).sum() / weights.sum().clamp_min(1.0)
+    return loss.mean()
 
 
 def _inactive_loss(out, target):
@@ -51,7 +61,7 @@ def _inactive_loss(out, target):
 def _transition_loss(model, batch, cfg):
     out = model(before_grid=batch["before_grid"], after_grid=batch["after_grid"])
     label = F.binary_cross_entropy_with_logits(out["cause_logits"], batch["target_multihot"])
-    masks = _mask_loss(out, batch)
+    masks = _mask_loss(out, batch, cfg)
     inactive = _inactive_loss(out, batch["target_multihot"])
     total = (
         cfg.get("label_weight", 1.0) * label
@@ -63,6 +73,17 @@ def _transition_loss(model, batch, cfg):
 
 def _cosine_gap(vec_a, vec_b):
     return 1.0 - F.cosine_similarity(vec_a, vec_b, dim=1).mean()
+
+
+def _active_map_mse(map_a, map_b, active):
+    terms = []
+    for k in range(active.shape[1]):
+        rows = active[:, k] > 0.5
+        if rows.any():
+            terms.append(F.mse_loss(map_a[rows, k], map_b[rows, k]))
+    if not terms:
+        return map_a.sum() * 0.0
+    return torch.stack(terms).mean()
 
 
 def _tuple_loss(model, batch, cfg):
@@ -77,8 +98,7 @@ def _tuple_loss(model, batch, cfg):
     for key in list(metrics):
         metrics[key] = metrics[key] / len(names)
 
-    # Existing tuples provide only A_then_B. This gives the valid B context term:
-    # E_B(base->B) should match E_B(A->AB).
+    # Existing tuples provide only A_then_B. This gives the valid B context term.
     b_active = batch["base_to_B"]["target_multihot"] > 0.5
     context_terms, raw_gaps = [], []
     for k in range(4):
@@ -93,24 +113,32 @@ def _tuple_loss(model, batch, cfg):
     zero = outs["base_to_A"]["cause_logits"].sum() * 0.0
     context = torch.stack(context_terms).mean() if context_terms else zero
 
-    union_terms = []
+    vector_union_terms = []
     for source_name in ("base_to_A", "base_to_B"):
         target = batch[source_name]["target_multihot"]
         for k in range(4):
             active = target[:, k] > 0.5
             if active.any():
-                union_terms.append(_cosine_gap(
+                vector_union_terms.append(_cosine_gap(
                     outs[source_name]["evidence_vectors"][active, k],
                     outs["base_to_AB"]["evidence_vectors"][active, k],
                 ))
-    union = torch.stack(union_terms).mean() if union_terms else zero
+    vector_union = torch.stack(vector_union_terms).mean() if vector_union_terms else zero
+    union_target = torch.maximum(outs["base_to_A"]["evidence_maps"], outs["A_to_AB"]["evidence_maps"])
+    map_union = F.mse_loss(outs["base_to_AB"]["evidence_maps"], union_target)
+    map_context = _active_map_mse(
+        outs["base_to_B"]["evidence_maps"], outs["A_to_AB"]["evidence_maps"], b_active.float())
     total = torch.stack(losses).mean()
     total = total + cfg.get("context_difference_weight", 0.0) * context
-    total = total + cfg.get("mixed_union_weight", 0.0) * union
+    total = total + cfg.get("mixed_union_weight", 0.0) * vector_union
+    total = total + cfg.get("map_union_weight", 0.0) * map_union
+    total = total + cfg.get("map_context_weight", 0.0) * map_context
     metrics.update({
         "context_difference_loss": context,
         "context_gap_B_in_A_context": torch.stack(raw_gaps).mean() if raw_gaps else zero,
-        "mixed_union_loss": union,
+        "mixed_union_loss": vector_union,
+        "map_union_loss": map_union,
+        "map_context_loss": map_context,
     })
     return total, {k: float(v.detach()) for k, v in metrics.items()}
 
@@ -163,6 +191,8 @@ def main():
         hidden_channels=cfg.get("hidden_channels", 48),
         use_diff_channels=cfg.get("use_diff_channels", True),
         label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
+        label_readout=cfg.get("label_readout"),
+        readout_tau=cfg.get("readout_tau", 0.5),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-4))
     train_ds = CounterfactualTupleDataset(split_path(cfg["data_dir"], cfg.get("tuple_train_split", "train_tuple_seen")), args.max_tuples)
@@ -207,6 +237,8 @@ def main():
     write_json(os.path.join(run_dir, "manifest.json"), {
         **metadata, "status": "complete", "method": cfg.get("method", "evidence_mask"),
         "loss_name": cfg.get("loss_name", "primitive_mask_loss"),
+        "command": " ".join(sys.argv),
+        "runtime": {"epochs": epochs},
         "causes": CAUSES, "heldout_pair_names": pair_names(cfg["heldout_composed_pair_id"]),
         "checkpoint_paths": {"last": "last.pt", "best_val_composed_seen_exact": "best_val_composed_seen_exact.pt"},
     })

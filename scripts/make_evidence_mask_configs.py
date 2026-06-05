@@ -10,35 +10,87 @@ from scripts.final_common import FOLDS
 
 
 VARIANTS = {
-    "bce_only": dict(
+    "learned_bce_only": dict(
         primitive_mask_weight=0.0, inactive_weight=0.0,
         context_difference_weight=0.0, mixed_union_weight=0.0,
-        use_diff_channels=True, label_from_evidence_pool=False,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="learned_classifier",
     ),
-    "bce_mask": dict(
+    "learned_bce_mask": dict(
         primitive_mask_weight=1.0, inactive_weight=0.0,
         context_difference_weight=0.0, mixed_union_weight=0.0,
-        use_diff_channels=True, label_from_evidence_pool=False,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="learned_classifier",
     ),
-    "bce_mask_inactive": dict(
+    "evidence_maxpool_bce_mask": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="evidence_maxpool",
+    ),
+    "evidence_logsumexp_bce_mask": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "evidence_noisy_or_bce_mask": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="evidence_noisy_or",
+    ),
+    "logsumexp_mask_map_union": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.5,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "logsumexp_mask_map_context": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.5, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "logsumexp_mask_vector_context": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.2, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.0,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "logsumexp_mask_vector_context_conflict_aware": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.2, mixed_union_weight=0.0,
+        map_context_weight=0.0, map_union_weight=0.0,
+        conflict_aware_mask_loss=True,
+        conflict_mask_downweight=0.1,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "logsumexp_mask_map_context_union": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
+        context_difference_weight=0.0, mixed_union_weight=0.0,
+        map_context_weight=0.5, map_union_weight=0.5,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
+    ),
+    "logsumexp_mask_context_union_inactive": dict(
         primitive_mask_weight=1.0, inactive_weight=0.05,
         context_difference_weight=0.0, mixed_union_weight=0.0,
-        use_diff_channels=True, label_from_evidence_pool=False,
+        map_context_weight=0.5, map_union_weight=0.5,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
     ),
-    "bce_mask_inactive_context": dict(
-        primitive_mask_weight=1.0, inactive_weight=0.05,
-        context_difference_weight=0.2, mixed_union_weight=0.2,
-        use_diff_channels=True, label_from_evidence_pool=False,
-    ),
-    "no_diff_channels": dict(
-        primitive_mask_weight=1.0, inactive_weight=0.05,
+    "logsumexp_mask_union_conflict_aware": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
         context_difference_weight=0.0, mixed_union_weight=0.0,
-        use_diff_channels=False, label_from_evidence_pool=False,
+        map_context_weight=0.0, map_union_weight=0.5,
+        conflict_aware_mask_loss=True,
+        conflict_mask_downweight=0.1,
+        use_diff_channels=True, label_readout="evidence_logsumexp", readout_tau=0.5,
     ),
-    "label_from_evidence_maxpool": dict(
-        primitive_mask_weight=1.0, inactive_weight=0.05,
+    "no_diff_channels_logsumexp_mask_union": dict(
+        primitive_mask_weight=1.0, inactive_weight=0.0,
         context_difference_weight=0.0, mixed_union_weight=0.0,
-        use_diff_channels=True, label_from_evidence_pool=True,
+        map_context_weight=0.0, map_union_weight=0.5,
+        use_diff_channels=False, label_readout="evidence_logsumexp", readout_tau=0.5,
     ),
 }
 
@@ -68,7 +120,7 @@ def config_for(fold, variant, seed, smoke=False):
         "weight_decay": 0.0001,
         "label_weight": 1.0,
         "checkpoint_metric": "val_exact",
-        "run_name": f"evidence_mask_{name}",
+        "run_name": f"evidence_mask_sieve_{name}",
         **VARIANTS[variant],
     }
 
@@ -77,7 +129,7 @@ def main():
     out_dir = "configs/evidence_mask"
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "smoke.yaml"), "w") as handle:
-        yaml.safe_dump(config_for(FOLDS[0], "bce_mask_inactive", 0, smoke=True), handle, sort_keys=False)
+        yaml.safe_dump(config_for(FOLDS[0], "evidence_logsumexp_bce_mask", 0, smoke=True), handle, sort_keys=False)
     for fold in FOLDS:
         for seed in (0, 1):
             for variant in VARIANTS:

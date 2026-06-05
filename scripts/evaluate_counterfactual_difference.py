@@ -32,7 +32,67 @@ def _mean(values):
     return float(np.mean(values)) if values else None
 
 
-def _mask_stats(pred, target):
+def _subset_key(bits):
+    return "".join(str(int(x)) for x in bits)
+
+
+def _metrics_at_threshold(preds, targets, threshold):
+    if np.isscalar(threshold):
+        return compute_multilabel_metrics(preds, targets, threshold=float(threshold))
+    preds_b = preds > np.asarray(threshold)[None, :]
+    targets_b = targets > 0.5
+    eps = 1e-8
+    exact = float((preds_b == targets_b).all(axis=1).mean())
+    per_label = {}
+    tp_all = fp_all = fn_all = 0
+    names = ["sensory_update", "value_remap", "map_remap", "action_remap"]
+    for i, name in enumerate(names):
+        tp = int((preds_b[:, i] & targets_b[:, i]).sum())
+        fp = int((preds_b[:, i] & ~targets_b[:, i]).sum())
+        fn = int((~preds_b[:, i] & targets_b[:, i]).sum())
+        precision = tp / (tp + fp + eps)
+        recall = tp / (tp + fn + eps)
+        f1 = 2 * precision * recall / (precision + recall + eps)
+        per_label[name] = {
+            "precision": float(precision), "recall": float(recall), "f1": float(f1),
+            "tp": tp, "fp": fp, "fn": fn,
+        }
+        tp_all += tp
+        fp_all += fp
+        fn_all += fn
+    micro_p = tp_all / (tp_all + fp_all + eps)
+    micro_r = tp_all / (tp_all + fn_all + eps)
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r + eps)
+    return {
+        "exact_match": exact,
+        "micro_f1": float(micro_f1),
+        "macro_f1": float(np.mean([row["f1"] for row in per_label.values()])),
+        "per_label": per_label,
+        "n_samples": int(len(targets)),
+    }
+
+
+def _tune_thresholds(preds, targets):
+    grid = np.linspace(0.05, 0.95, 19)
+    thresholds = []
+    targets_b = targets > 0.5
+    for k in range(targets.shape[1]):
+        best_t, best_f1 = 0.5, -1.0
+        for threshold in grid:
+            pred_b = preds[:, k] > threshold
+            tp = (pred_b & targets_b[:, k]).sum()
+            fp = (pred_b & ~targets_b[:, k]).sum()
+            fn = (~pred_b & targets_b[:, k]).sum()
+            precision = tp / (tp + fp + 1e-8)
+            recall = tp / (tp + fn + 1e-8)
+            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+            if f1 > best_f1:
+                best_f1, best_t = float(f1), float(threshold)
+        thresholds.append(best_t)
+    return thresholds
+
+
+def _mask_stats(pred, target, label_targets=None):
     pred_bin = pred > 0.5
     target_bin = target > 0.5
     inter = (pred_bin & target_bin).sum(axis=(0, 2, 3))
@@ -42,14 +102,27 @@ def _mask_stats(pred, target):
     dice = (2 * inter + 1e-5) / (pred_sum + target_sum + 1e-5)
     iou = (inter + 1e-5) / (union + 1e-5)
     fp = np.maximum(pred_sum - inter, 0) / np.maximum(pred_sum, 1)
-    return {
+    per_sample_inter = (pred_bin & target_bin).sum(axis=(2, 3))
+    per_sample_sum = pred_bin.sum(axis=(2, 3)) + target_bin.sum(axis=(2, 3))
+    per_sample_dice = (2 * per_sample_inter + 1e-5) / (per_sample_sum + 1e-5)
+    stats = {
         cause: {"dice": float(dice[i]), "iou": float(iou[i]), "false_positive_fraction": float(fp[i])}
         for i, cause in enumerate(CAUSES)
     }
+    if label_targets is not None:
+        labels = label_targets > 0.5
+        for i, cause in enumerate(CAUSES):
+            active = labels[:, i]
+            inactive = ~active
+            stats[cause]["active_only_dice"] = float(per_sample_dice[active, i].mean()) if active.any() else None
+            stats[cause]["inactive_false_positive_evidence"] = (
+                float(pred[:, i][inactive].mean()) if inactive.any() else None
+            )
+    return stats
 
 
 @torch.no_grad()
-def evaluate_split(model, path, cfg, device, tuple_roles=None):
+def collect_split(model, path, cfg, device, tuple_roles=None):
     ds = CounterfactualTransitionDataset(path, roles=tuple_roles)
     loader = DataLoader(ds, batch_size=cfg.get("batch_size", 256))
     preds, targets, masks, mask_targets, roles = [], [], [], [], []
@@ -66,19 +139,56 @@ def evaluate_split(model, path, cfg, device, tuple_roles=None):
         roles.extend(batch["transition_role_id"].cpu().numpy().tolist())
         inactive_mask = batch["target_multihot"] <= 0.5
         inactive.extend(out["evidence_maps"].mean(dim=(2, 3))[inactive_mask].cpu().numpy().tolist())
-    pred = np.concatenate(preds)
-    target = np.concatenate(targets)
+    return {
+        "pred": np.concatenate(preds),
+        "target": np.concatenate(targets),
+        "masks": np.concatenate(masks),
+        "mask_targets": np.concatenate(mask_targets),
+        "roles": np.array(roles),
+        "inactive": inactive,
+    }
+
+
+def evaluate_collected(values, val_thresholds=None):
+    pred = values["pred"]
+    target = values["target"]
     metrics = compute_multilabel_metrics(pred, target)
+    heldout_thresholds = _tune_thresholds(pred, target)
+    threshold_metrics = {
+        "exact_fixed_0p5": metrics["exact_match"],
+        "exact_val_tuned": (
+            _metrics_at_threshold(pred, target, val_thresholds)["exact_match"]
+            if val_thresholds is not None else None
+        ),
+        "exact_heldout_oracle_threshold_diagnostic": _metrics_at_threshold(
+            pred, target, heldout_thresholds)["exact_match"],
+        "val_tuned_thresholds": val_thresholds,
+        "heldout_oracle_thresholds_diagnostic": heldout_thresholds,
+    }
     role_metrics = {}
-    roles_arr = np.array(roles)
+    roles_arr = values["roles"]
     for name, role_id in ROLE_TO_ID.items():
         idx = roles_arr == role_id
         if idx.any():
-            role_metrics[name] = compute_multilabel_metrics(pred[idx], target[idx])
+            role_metrics[name] = {
+                **compute_multilabel_metrics(pred[idx], target[idx]),
+                "exact_val_tuned": (
+                    _metrics_at_threshold(pred[idx], target[idx], val_thresholds)["exact_match"]
+                    if val_thresholds is not None else None
+                ),
+            }
+    pred_b = pred > 0.5
+    target_b = target > 0.5
+    confusion = {}
+    for t, p in zip(target_b, pred_b):
+        key = f"{_subset_key(t)}->{_subset_key(p)}"
+        confusion[key] = confusion.get(key, 0) + 1
     metrics.update({
-        "inactive_evidence_magnitude": _mean(inactive),
-        "primitive_mask": _mask_stats(np.concatenate(masks), np.concatenate(mask_targets)),
+        **threshold_metrics,
+        "inactive_evidence_magnitude": _mean(values["inactive"]),
+        "primitive_mask": _mask_stats(values["masks"], values["mask_targets"], target),
         "role_metrics": role_metrics,
+        "subset_confusion": confusion,
     })
     return metrics
 
@@ -141,17 +251,31 @@ def main():
         hidden_channels=cfg.get("hidden_channels", 48),
         use_diff_channels=cfg.get("use_diff_channels", True),
         label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
+        label_readout=cfg.get("label_readout"),
+        readout_tau=cfg.get("readout_tau", 0.5),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
+    val_thresholds = None
+    try:
+        val_values = collect_split(model, split_path(cfg["data_dir"], cfg.get("val_split", "val_composed_seen")), cfg, device)
+        val_thresholds = _tune_thresholds(val_values["pred"], val_values["target"])
+    except (OSError, ValueError, zipfile.BadZipFile):
+        pass
     splits = {}
     for split in ("test_single", "test_composed_seen", "test_composed_heldout"):
         try:
-            splits[split] = evaluate_split(model, split_path(cfg["data_dir"], split), cfg, device)
+            splits[split] = evaluate_collected(
+                collect_split(model, split_path(cfg["data_dir"], split), cfg, device),
+                val_thresholds=val_thresholds,
+            )
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             splits[split] = {"status": "failed", "error": repr(exc)}
     tuple_path = split_path(cfg["data_dir"], cfg.get("tuple_test_split", "test_tuple_heldout"))
     try:
-        splits["test_tuple_heldout_transitions"] = evaluate_split(model, tuple_path, cfg, device)
+        splits["test_tuple_heldout_transitions"] = evaluate_collected(
+            collect_split(model, tuple_path, cfg, device),
+            val_thresholds=val_thresholds,
+        )
         diagnostics = context_diagnostics(model, tuple_path, cfg, device)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         splits["test_tuple_heldout_transitions"] = {"status": "failed", "error": repr(exc)}
@@ -171,6 +295,19 @@ def main():
         "checkpoint_used": args.checkpoint, "split_metrics": splits,
         "context_diagnostics": diagnostics,
         "primitive_diff_rule": primitive,
+        "threshold_calibration": {
+            "source_split": cfg.get("val_split", "val_composed_seen"),
+            "val_tuned_thresholds": val_thresholds,
+            "method": "per-label F1 grid search on validation predictions",
+        },
+        "readout_type": cfg.get("label_readout", "evidence_maxpool" if cfg.get("label_from_evidence_pool") else "learned_classifier"),
+        "loss_weights": {
+            key: cfg.get(key, 0.0)
+            for key in (
+                "primitive_mask_weight", "inactive_weight", "context_difference_weight",
+                "mixed_union_weight", "map_union_weight", "map_context_weight",
+            )
+        },
     }
     output = args.output or os.path.join("results", cfg["run_name"], "eval_counterfactual_difference.json")
     write_json(output, report)
