@@ -92,6 +92,35 @@ def _tune_thresholds(preds, targets):
     return thresholds
 
 
+def _tune_thresholds_exact(preds, targets):
+    grid = np.linspace(0.05, 0.95, 19)
+    targets_b = targets > 0.5
+    best_thresholds, best_exact = [0.5] * targets.shape[1], -1.0
+    for combo in np.stack(np.meshgrid(*([grid] * targets.shape[1]), indexing="ij"), axis=-1).reshape(-1, targets.shape[1]):
+        exact = ((preds > combo[None, :]) == targets_b).all(axis=1).mean()
+        if exact > best_exact:
+            best_exact = float(exact)
+            best_thresholds = [float(x) for x in combo]
+    return best_thresholds
+
+
+def _evidence_scores(maps, topk=3):
+    flat = maps.reshape(maps.shape[0], maps.shape[1], -1)
+    k = max(1, min(int(topk), flat.shape[2]))
+    return np.sort(flat, axis=2)[:, :, -k:].mean(axis=2)
+
+
+def _tune_evidence_threshold(maps, targets, topk=3):
+    scores = _evidence_scores(maps, topk=topk)
+    targets_b = targets > 0.5
+    best_t, best_exact = 0.5, -1.0
+    for threshold in np.linspace(0.05, 0.95, 19):
+        exact = ((scores > threshold) == targets_b).all(axis=1).mean()
+        if exact > best_exact:
+            best_exact, best_t = float(exact), float(threshold)
+    return best_t
+
+
 def _mask_stats(pred, target, label_targets=None):
     pred_bin = pred > 0.5
     target_bin = target > 0.5
@@ -121,11 +150,54 @@ def _mask_stats(pred, target, label_targets=None):
     return stats
 
 
+def _subset_confusion(pred, target, threshold=0.5):
+    pred_b = pred > threshold
+    target_b = target > 0.5
+    confusion = {}
+    for t, p in zip(target_b, pred_b):
+        key = f"{_subset_key(t)}->{_subset_key(p)}"
+        confusion[key] = confusion.get(key, 0) + 1
+    return confusion
+
+
+def _faithfulness(values, label_thresholds=0.5, evidence_threshold=0.5, evidence_topk=3):
+    pred = values["pred"]
+    target = values["target"]
+    scores = _evidence_scores(values["masks"], topk=evidence_topk)
+    if np.isscalar(label_thresholds):
+        label_pred = pred > float(label_thresholds)
+    else:
+        label_pred = pred > np.asarray(label_thresholds)[None, :]
+    label_good = (label_pred == (target > 0.5)).all(axis=1)
+    mask_good = ((scores > evidence_threshold) == (target > 0.5)).all(axis=1)
+    counts = {
+        "mask_good_label_good": int((mask_good & label_good).sum()),
+        "mask_good_label_bad": int((mask_good & ~label_good).sum()),
+        "mask_bad_label_good": int((~mask_good & label_good).sum()),
+        "mask_bad_label_bad": int((~mask_good & ~label_good).sum()),
+    }
+    correlations = {}
+    logits = values.get("logits")
+    if logits is not None:
+        for i, cause in enumerate(CAUSES):
+            if np.std(logits[:, i]) > 1e-8 and np.std(scores[:, i]) > 1e-8:
+                corr = np.corrcoef(logits[:, i], scores[:, i])[0, 1]
+                correlations[cause] = float(corr)
+            else:
+                correlations[cause] = None
+    return {
+        **counts,
+        "evidence_threshold": float(evidence_threshold),
+        "evidence_topk": int(evidence_topk),
+        "label_logit_pooled_evidence_correlation": correlations,
+    }
+
+
 @torch.no_grad()
 def collect_split(model, path, cfg, device, tuple_roles=None):
     ds = CounterfactualTransitionDataset(path, roles=tuple_roles)
     loader = DataLoader(ds, batch_size=cfg.get("batch_size", 256))
-    preds, targets, masks, mask_targets, roles = [], [], [], [], []
+    preds, logits, targets, masks, mask_targets, roles = [], [], [], [], [], []
     inactive = []
     model.eval()
     for batch in loader:
@@ -133,6 +205,7 @@ def collect_split(model, path, cfg, device, tuple_roles=None):
         out = model(before_grid=batch["before_grid"], after_grid=batch["after_grid"])
         prob = torch.sigmoid(out["cause_logits"])
         preds.append(prob.cpu().numpy())
+        logits.append(out["cause_logits"].cpu().numpy())
         targets.append(batch["target_multihot"].cpu().numpy())
         masks.append(out["evidence_maps"].cpu().numpy())
         mask_targets.append(batch["primitive_masks"].cpu().numpy())
@@ -141,6 +214,7 @@ def collect_split(model, path, cfg, device, tuple_roles=None):
         inactive.extend(out["evidence_maps"].mean(dim=(2, 3))[inactive_mask].cpu().numpy().tolist())
     return {
         "pred": np.concatenate(preds),
+        "logits": np.concatenate(logits),
         "target": np.concatenate(targets),
         "masks": np.concatenate(masks),
         "mask_targets": np.concatenate(mask_targets),
@@ -149,21 +223,37 @@ def collect_split(model, path, cfg, device, tuple_roles=None):
     }
 
 
-def evaluate_collected(values, val_thresholds=None):
+def evaluate_collected(values, val_f1_thresholds=None, val_exact_thresholds=None, val_evidence_threshold=None):
     pred = values["pred"]
     target = values["target"]
     metrics = compute_multilabel_metrics(pred, target)
-    heldout_thresholds = _tune_thresholds(pred, target)
+    heldout_f1_thresholds = _tune_thresholds(pred, target)
+    heldout_exact_thresholds = _tune_thresholds_exact(pred, target)
+    evidence_threshold = 0.5 if val_evidence_threshold is None else val_evidence_threshold
     threshold_metrics = {
         "exact_fixed_0p5": metrics["exact_match"],
-        "exact_val_tuned": (
-            _metrics_at_threshold(pred, target, val_thresholds)["exact_match"]
-            if val_thresholds is not None else None
+        "exact_val_f1_tuned": (
+            _metrics_at_threshold(pred, target, val_f1_thresholds)["exact_match"]
+            if val_f1_thresholds is not None else None
         ),
+        "exact_val_exact_tuned": (
+            _metrics_at_threshold(pred, target, val_exact_thresholds)["exact_match"]
+            if val_exact_thresholds is not None else None
+        ),
+        "exact_heldout_exact_tuned_diagnostic": _metrics_at_threshold(
+            pred, target, heldout_exact_thresholds)["exact_match"],
         "exact_heldout_oracle_threshold_diagnostic": _metrics_at_threshold(
-            pred, target, heldout_thresholds)["exact_match"],
-        "val_tuned_thresholds": val_thresholds,
-        "heldout_oracle_thresholds_diagnostic": heldout_thresholds,
+            pred, target, heldout_exact_thresholds)["exact_match"],
+        "val_f1_tuned_thresholds": val_f1_thresholds,
+        "val_exact_tuned_thresholds": val_exact_thresholds,
+        "heldout_exact_tuned_thresholds_diagnostic": heldout_exact_thresholds,
+        "heldout_f1_tuned_thresholds_diagnostic": heldout_f1_thresholds,
+        # Backward-compatible aliases for older summaries.
+        "exact_val_tuned": (
+            _metrics_at_threshold(pred, target, val_exact_thresholds)["exact_match"]
+            if val_exact_thresholds is not None else None
+        ),
+        "val_tuned_thresholds": val_exact_thresholds,
     }
     role_metrics = {}
     roles_arr = values["roles"]
@@ -172,21 +262,32 @@ def evaluate_collected(values, val_thresholds=None):
         if idx.any():
             role_metrics[name] = {
                 **compute_multilabel_metrics(pred[idx], target[idx]),
-                "exact_val_tuned": (
-                    _metrics_at_threshold(pred[idx], target[idx], val_thresholds)["exact_match"]
-                    if val_thresholds is not None else None
+                "exact_val_f1_tuned": (
+                    _metrics_at_threshold(pred[idx], target[idx], val_f1_thresholds)["exact_match"]
+                    if val_f1_thresholds is not None else None
+                ),
+                "exact_val_exact_tuned": (
+                    _metrics_at_threshold(pred[idx], target[idx], val_exact_thresholds)["exact_match"]
+                    if val_exact_thresholds is not None else None
                 ),
             }
-    pred_b = pred > 0.5
-    target_b = target > 0.5
-    confusion = {}
-    for t, p in zip(target_b, pred_b):
-        key = f"{_subset_key(t)}->{_subset_key(p)}"
-        confusion[key] = confusion.get(key, 0) + 1
+    confusion = _subset_confusion(pred, target)
     metrics.update({
         **threshold_metrics,
         "inactive_evidence_magnitude": _mean(values["inactive"]),
         "primitive_mask": _mask_stats(values["masks"], values["mask_targets"], target),
+        "faithfulness": _faithfulness(
+            values,
+            label_thresholds=0.5,
+            evidence_threshold=0.5,
+            evidence_topk=3,
+        ),
+        "faithfulness_val_evidence_tuned": _faithfulness(
+            values,
+            label_thresholds=0.5,
+            evidence_threshold=evidence_threshold,
+            evidence_topk=3,
+        ),
         "role_metrics": role_metrics,
         "subset_confusion": confusion,
     })
@@ -253,12 +354,17 @@ def main():
         label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
         label_readout=cfg.get("label_readout"),
         readout_tau=cfg.get("readout_tau", 0.5),
+        readout_topk=cfg.get("readout_topk", 1),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
-    val_thresholds = None
+    val_f1_thresholds = None
+    val_exact_thresholds = None
+    val_evidence_threshold = None
     try:
         val_values = collect_split(model, split_path(cfg["data_dir"], cfg.get("val_split", "val_composed_seen")), cfg, device)
-        val_thresholds = _tune_thresholds(val_values["pred"], val_values["target"])
+        val_f1_thresholds = _tune_thresholds(val_values["pred"], val_values["target"])
+        val_exact_thresholds = _tune_thresholds_exact(val_values["pred"], val_values["target"])
+        val_evidence_threshold = _tune_evidence_threshold(val_values["masks"], val_values["target"], topk=3)
     except (OSError, ValueError, zipfile.BadZipFile):
         pass
     splits = {}
@@ -266,7 +372,9 @@ def main():
         try:
             splits[split] = evaluate_collected(
                 collect_split(model, split_path(cfg["data_dir"], split), cfg, device),
-                val_thresholds=val_thresholds,
+                val_f1_thresholds=val_f1_thresholds,
+                val_exact_thresholds=val_exact_thresholds,
+                val_evidence_threshold=val_evidence_threshold,
             )
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             splits[split] = {"status": "failed", "error": repr(exc)}
@@ -274,7 +382,9 @@ def main():
     try:
         splits["test_tuple_heldout_transitions"] = evaluate_collected(
             collect_split(model, tuple_path, cfg, device),
-            val_thresholds=val_thresholds,
+            val_f1_thresholds=val_f1_thresholds,
+            val_exact_thresholds=val_exact_thresholds,
+            val_evidence_threshold=val_evidence_threshold,
         )
         diagnostics = context_diagnostics(model, tuple_path, cfg, device)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
@@ -297,8 +407,12 @@ def main():
         "primitive_diff_rule": primitive,
         "threshold_calibration": {
             "source_split": cfg.get("val_split", "val_composed_seen"),
-            "val_tuned_thresholds": val_thresholds,
-            "method": "per-label F1 grid search on validation predictions",
+            "val_f1_tuned_thresholds": val_f1_thresholds,
+            "val_exact_tuned_thresholds": val_exact_thresholds,
+            "val_evidence_threshold_topk3": val_evidence_threshold,
+            "primary_metric": "exact_fixed_0p5",
+            "secondary_metric": "exact_val_exact_tuned",
+            "method": "grid search on validation predictions; exact tuning is exhaustive over 4 labels",
         },
         "readout_type": cfg.get("label_readout", "evidence_maxpool" if cfg.get("label_from_evidence_pool") else "learned_classifier"),
         "loss_weights": {
@@ -308,6 +422,9 @@ def main():
                 "mixed_union_weight", "map_union_weight", "map_context_weight",
             )
         },
+        "readout_topk": cfg.get("readout_topk"),
+        "readout_tau": cfg.get("readout_tau"),
+        "detach_map_union_target": cfg.get("detach_map_union_target", False),
     }
     output = args.output or os.path.join("results", cfg["run_name"], "eval_counterfactual_difference.json")
     write_json(output, report)

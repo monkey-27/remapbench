@@ -15,6 +15,7 @@ class DiffCauseNet(nn.Module):
         label_from_evidence_pool=False,
         label_readout=None,
         readout_tau=0.5,
+        readout_topk=1,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -23,6 +24,7 @@ class DiffCauseNet(nn.Module):
             label_readout = "evidence_maxpool" if label_from_evidence_pool else "learned_classifier"
         self.label_readout = label_readout
         self.readout_tau = float(readout_tau)
+        self.readout_topk = int(readout_topk)
         model_channels = in_channels * (4 if use_diff_channels else 2)
         self.encoder = nn.Sequential(
             nn.Conv2d(model_channels, hidden_channels, 3, padding=1),
@@ -56,9 +58,19 @@ class DiffCauseNet(nn.Module):
             flat_logits = evidence_logits.flatten(2)
             if self.label_readout == "evidence_maxpool":
                 logits = flat_logits.amax(dim=2)
+            elif self.label_readout == "evidence_topk":
+                k = max(1, min(self.readout_topk, flat_logits.shape[2]))
+                logits = flat_logits.topk(k, dim=2).values.mean(dim=2) - self.readout_bias
             elif self.label_readout == "evidence_logsumexp":
                 tau = max(self.readout_tau, 1e-4)
                 logits = tau * torch.logsumexp(flat_logits / tau, dim=2) - self.readout_bias
+            elif self.label_readout == "evidence_logsumexp_norm":
+                tau = max(self.readout_tau, 1e-4)
+                pixels = flat_logits.shape[2]
+                logits = tau * (
+                    torch.logsumexp(flat_logits / tau, dim=2)
+                    - torch.log(torch.tensor(float(pixels), device=flat_logits.device))
+                ) - self.readout_bias
             elif self.label_readout == "evidence_noisy_or":
                 probs = torch.sigmoid(flat_logits)
                 any_prob = 1.0 - (1.0 - probs).clamp_min(1e-6).prod(dim=2)

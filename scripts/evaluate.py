@@ -38,7 +38,11 @@ GATE_ABLATION_MODES = [
 
 def get_device(cfg_device):
     if cfg_device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
     return torch.device(cfg_device)
 
 

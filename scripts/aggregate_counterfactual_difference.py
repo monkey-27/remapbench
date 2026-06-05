@@ -34,6 +34,14 @@ def _mean(values):
     return sum(values) / len(values) if values else None
 
 
+def _std(values):
+    values = [value for value in values if value is not None]
+    if len(values) < 2:
+        return 0.0 if values else None
+    mean = sum(values) / len(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
 def row_for(run_dir):
     report = _read(run_dir / "eval_counterfactual_difference.json")
     audit = _read(run_dir / "audit_counterfactual_difference.json")
@@ -61,14 +69,17 @@ def row_for(run_dir):
     variant = variant.replace("full", "bce_mask_inactive_context")
     confusion = heldout.get("subset_confusion", {})
     wrong = {key: value for key, value in confusion.items() if key.split("->")[0] != key.split("->")[1]}
+    faithfulness = heldout.get("faithfulness", {})
     return {
         "run_name": run_dir.name,
         "fold_name": report.get("fold_name"),
         "variant": variant,
         "readout": report.get("readout_type", cfg.get("label_readout")),
+        "topk": report.get("readout_topk", cfg.get("readout_topk")),
         "mask_loss": float(losses.get("primitive_mask_weight", cfg.get("primitive_mask_weight", 0.0))) > 0,
         "map_context": float(losses.get("map_context_weight", cfg.get("map_context_weight", 0.0))) > 0,
         "map_union": float(losses.get("map_union_weight", cfg.get("map_union_weight", 0.0))) > 0,
+        "detached_map_union": bool(report.get("detach_map_union_target", cfg.get("detach_map_union_target", False))),
         "vector_context": float(losses.get("context_difference_weight", cfg.get("context_difference_weight", 0.0))) > 0,
         "inactive": float(losses.get("inactive_weight", cfg.get("inactive_weight", 0.0))) > 0,
         "conflict_aware": bool(cfg.get("conflict_aware_mask_loss", False)),
@@ -77,8 +88,11 @@ def row_for(run_dir):
         "audit_status": audit.get("status") if audit else None,
         "audit_warnings": len(audit.get("warnings", [])) if audit else None,
         "exact_fixed_0p5": heldout.get("exact_fixed_0p5", heldout.get("exact_match")),
-        "exact_val_tuned": heldout.get("exact_val_tuned"),
-        "heldout_diagnostic_threshold_exact": heldout.get("exact_heldout_oracle_threshold_diagnostic"),
+        "exact_val_f1_tuned": heldout.get("exact_val_f1_tuned"),
+        "exact_val_exact_tuned": heldout.get("exact_val_exact_tuned", heldout.get("exact_val_tuned")),
+        "exact_val_tuned": heldout.get("exact_val_exact_tuned", heldout.get("exact_val_tuned")),
+        "heldout_diagnostic_threshold_exact": heldout.get("exact_heldout_exact_tuned_diagnostic", heldout.get("exact_heldout_oracle_threshold_diagnostic")),
+        "exact_heldout_exact_tuned_diagnostic": heldout.get("exact_heldout_exact_tuned_diagnostic", heldout.get("exact_heldout_oracle_threshold_diagnostic")),
         "heldout_exact": heldout.get("exact_match"),
         "seen_exact": seen.get("exact_match"),
         "single_exact": single.get("exact_match"),
@@ -91,6 +105,10 @@ def row_for(run_dir):
             if isinstance(row, dict) and row.get("active_only_dice") is not None
         ]),
         "inactive_evidence": heldout.get("inactive_evidence_magnitude"),
+        "mask_good_label_bad": faithfulness.get("mask_good_label_bad"),
+        "mask_good_label_good": faithfulness.get("mask_good_label_good"),
+        "mask_bad_label_good": faithfulness.get("mask_bad_label_good"),
+        "mask_bad_label_bad": faithfulness.get("mask_bad_label_bad"),
         "most_common_wrong_subset": max(wrong.items(), key=lambda item: item[1])[0] if wrong else None,
         "symmetric_ba_available": context.get("symmetric_ba_available"),
         "context_gap_by_cause": context.get("context_gap_by_cause"),
@@ -103,7 +121,7 @@ def main():
     parser.add_argument("--results-root", default="results")
     args = parser.parse_args()
     root = Path(args.results_root)
-    run_dirs = sorted(set(root.glob("evidence_mask_*")) | set(root.glob("cdt_*")))
+    run_dirs = sorted(set(root.glob("evidence_mask_*")) | set(root.glob("evidence_readout_*")) | set(root.glob("cdt_*")))
     rows = [row for row in (row_for(path) for path in run_dirs) if row]
     trusted = [
         row for row in rows
@@ -130,6 +148,28 @@ def main():
         }
         for key, values in sorted(grouped.items())
     }
+    readout_rows = [
+        row for row in trusted_unique
+        if row["run_name"].startswith("evidence_readout_sieve_")
+    ]
+    grouped_readout = {}
+    for row in readout_rows:
+        key = (row["variant"], row["fold_name"], row["readout"])
+        grouped_readout.setdefault(key, []).append(row)
+    averaged_readout = []
+    for (variant, fold_name, readout), group in sorted(grouped_readout.items()):
+        averaged_readout.append({
+            "variant": variant,
+            "fold": fold_name,
+            "readout": readout,
+            "n": len(group),
+            "mean_fixed_exact": _mean([row["exact_fixed_0p5"] for row in group]),
+            "std_fixed_exact": _std([row["exact_fixed_0p5"] for row in group]),
+            "mean_val_exact_tuned_exact": _mean([row["exact_val_exact_tuned"] for row in group]),
+            "std_val_exact_tuned_exact": _std([row["exact_val_exact_tuned"] for row in group]),
+            "mean_mask_good_label_bad": _mean([row["mask_good_label_bad"] for row in group]),
+            "mean_active_dice": _mean([row["active_mask_dice"] for row in group]),
+        })
     disagreement = {}
     for run in run_dirs:
         audit = _read(run / "primitive_diff_rule_audit.json")
@@ -142,64 +182,51 @@ def main():
         "trusted_rows": trusted,
         "trusted_unique_rows": trusted_unique,
         "by_variant": by_variant,
+        "readout_sieve_rows": readout_rows,
+        "readout_sieve_averaged": averaged_readout,
         "decision_note": (
             "Evidence-mask supervision is the main method. Context/CDT should stay an ablation "
             "unless it adds robust heldout gains across audited folds."
         ),
     }
     component_decisions = {
-        "diff_channels": {
+        "learned classifier": {
+            "decision": "discard",
+            "notes": "Fold1 fixed exact stays far below noisy-or; keep only as a baseline.",
+        },
+        "noisy-or": {
             "decision": "keep",
-            "notes": "Required by the evidence maps; no-diff remains a sanity ablation, not a finalist.",
+            "notes": "Best fixed-threshold heldout exact across fold0/fold1 with good seed stability.",
         },
-        "primitive_mask_supervision": {
-            "decision": "keep",
-            "notes": "BCE-only variants fail or stay weak while mask-supervised variants recover heldout exact.",
-        },
-        "evidence_pooled_readout": {
-            "decision": "keep",
-            "notes": "Evidence-pooled readouts beat the learned classifier on the hard fold1 split.",
-        },
-        "learned_classifier": {
+        "topk1": {
             "decision": "discard",
-            "notes": "Keep only as a baseline; it underperforms evidence-pooled readouts on fold1.",
+            "notes": "Strong on fold0 but collapses on fold1, especially seed1.",
         },
-        "evidence_noisy_or": {
-            "decision": "finalist",
-            "notes": "Strong fixed-threshold fold1 performance with no vector context; validate on clean fold2/fold3.",
-        },
-        "evidence_logsumexp": {
-            "decision": "ablation",
-            "notes": "Useful readout, but weaker than noisy-or without extra context on fold1.",
-        },
-        "evidence_maxpool": {
+        "topk3": {
             "decision": "discard",
-            "notes": "Excellent on fold0 but weak on fold1 relative to noisy-or.",
+            "notes": "Weak fixed-threshold exact on both fold0 and fold1; detached union does not rescue it.",
         },
-        "map_union": {
-            "decision": "ablation",
-            "notes": "Improves logsumexp mask-only on fold1 but does not beat noisy-or or vector context.",
-        },
-        "map_context": {
+        "topk5": {
             "decision": "discard",
-            "notes": "Does not beat map union on fold1, and context+union hurts.",
+            "notes": "Weakest top-k option; broader pooling hurts fixed exact on the hard fold.",
         },
-        "vector_context": {
-            "decision": "finalist_ablation",
-            "notes": "Can be very strong, but seed stability is mixed; validate on clean Modal folds before adopting.",
-        },
-        "inactive_loss": {
+        "normalized logsumexp": {
             "decision": "discard",
-            "notes": "Inactive loss variants hurt the hard fold1 split.",
+            "notes": "Better than top-k on fold1 but still well below noisy-or at fixed 0.5.",
         },
-        "conflict_aware_mask_loss": {
-            "decision": "discard_for_now",
-            "notes": "Conflict-aware weighting helped fold0 but hurt fold1 in the local sieve.",
+        "detached map union": {
+            "decision": "discard",
+            "notes": "Does not improve noisy-or and worsens normalized logsumexp on fold1.",
+        },
+        "threshold tuning": {
+            "decision": "secondary",
+            "notes": "Primary metric remains fixed 0.5 exact; val-exact tuning is secondary and F1 tuning is diagnostic.",
         },
     }
     summary["component_decisions"] = component_decisions
     write_json(root / "evidence_mask_sieve_summary.json", summary)
     write_json(root / "evidence_mask_pilot_summary.json", summary)
+    write_json(root / "evidence_readout_sieve_summary.json", summary)
     write_json(root / "evidence_mask_disagreement_report.json", {
         "note": "primitive_diff_rule is a rule baseline from primitive channel diffs, not an oracle for target labels.",
         "runs": disagreement,
@@ -222,6 +249,39 @@ def main():
     lines.extend(f"{key}: {json.dumps(value, sort_keys=True)}" for key, value in component_decisions.items())
     (root / "evidence_mask_sieve_tables.txt").write_text("\n".join(lines) + "\n")
     (root / "evidence_mask_pilot_tables.txt").write_text("\n".join(lines) + "\n")
+    readout_lines = [
+        "Evidence readout sieve",
+        "",
+        "Table 1 - main results",
+        "fold\tseed\tvariant\treadout\ttopk\tunion\texact_fixed_0p5\texact_val_exact_tuned\texact_val_f1_tuned\texact_heldout_exact_tuned_diagnostic\tseen_exact\tsingle_exact\tactive_mask_dice_mean\tinactive_evidence_mean\tmask_good_label_bad\tmost_common_wrong_subset",
+    ]
+    for row in readout_rows:
+        readout_lines.append("\t".join(str(value) for value in [
+            row["fold_name"], row["seed"], row["variant"], row["readout"], row["topk"],
+            row["map_union"], row["exact_fixed_0p5"], row["exact_val_exact_tuned"],
+            row["exact_val_f1_tuned"], row["exact_heldout_exact_tuned_diagnostic"],
+            row["seen_exact"], row["single_exact"], row["active_mask_dice"],
+            row["inactive_evidence"], row["mask_good_label_bad"], row["most_common_wrong_subset"],
+        ]))
+    readout_lines += [
+        "",
+        "Table 2 - averaged results",
+        "variant\tfold\treadout\tmean_fixed_exact\tstd_fixed_exact\tmean_val_exact_tuned_exact\tstd_val_exact_tuned_exact\tmean_mask_good_label_bad\tmean_active_dice",
+    ]
+    for row in averaged_readout:
+        readout_lines.append("\t".join(str(value) for value in [
+            row["variant"], row["fold"], row["readout"], row["mean_fixed_exact"],
+            row["std_fixed_exact"], row["mean_val_exact_tuned_exact"],
+            row["std_val_exact_tuned_exact"], row["mean_mask_good_label_bad"],
+            row["mean_active_dice"],
+        ]))
+    readout_lines += ["", "Table 3 - component decision", "component\tevidence\tdecision\tnotes"]
+    for key, value in component_decisions.items():
+        readout_lines.append("\t".join([
+            key, "see fixed 0.5 exact, seed stability, and mask_good_label_bad",
+            value["decision"], value["notes"],
+        ]))
+    (root / "evidence_readout_sieve_tables.txt").write_text("\n".join(readout_lines) + "\n")
     print(f"Aggregated {len(rows)} evidence-mask runs -> {root / 'evidence_mask_sieve_summary.json'}")
 
 

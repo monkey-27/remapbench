@@ -125,6 +125,8 @@ def _tuple_loss(model, batch, cfg):
                 ))
     vector_union = torch.stack(vector_union_terms).mean() if vector_union_terms else zero
     union_target = torch.maximum(outs["base_to_A"]["evidence_maps"], outs["A_to_AB"]["evidence_maps"])
+    if cfg.get("detach_map_union_target", False):
+        union_target = union_target.detach()
     map_union = F.mse_loss(outs["base_to_AB"]["evidence_maps"], union_target)
     map_context = _active_map_mse(
         outs["base_to_B"]["evidence_maps"], outs["A_to_AB"]["evidence_maps"], b_active.float())
@@ -193,6 +195,7 @@ def main():
         label_from_evidence_pool=cfg.get("label_from_evidence_pool", False),
         label_readout=cfg.get("label_readout"),
         readout_tau=cfg.get("readout_tau", 0.5),
+        readout_topk=cfg.get("readout_topk", 1),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-4))
     train_ds = CounterfactualTupleDataset(split_path(cfg["data_dir"], cfg.get("tuple_train_split", "train_tuple_seen")), args.max_tuples)
