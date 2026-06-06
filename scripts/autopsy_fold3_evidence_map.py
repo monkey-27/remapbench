@@ -730,7 +730,7 @@ def build_summary_from_json(out_dir):
         f"The learned failure comes from topology recall falling to {map_recall:.3f} when sensory and topology are composed."
     )
     targeted_fix = (
-        "Test a top-k noisy-or readout over evidence pixels for the final method, reusing the same mask supervision and folds."
+        "Test a cause-balanced / active-balanced mask loss that upweights topology-positive pixels in the sensory+topology fold."
     )
     do_not = (
         "Do not run broad architecture sweeps, larger transformers, new fold generation, or threshold-weakening experiments next."
@@ -906,7 +906,7 @@ def main():
         "Faithfulness and saturation diagnostics separate whether the misses are weak-map or readout calibration artifacts."
     )
     targeted_fix = (
-        "Test a top-k noisy-or readout over evidence pixels for the final method, reusing the same mask supervision and folds."
+        "Test a cause-balanced / active-balanced mask loss that upweights topology-positive pixels in the sensory+topology fold."
     )
     do_not = (
         "Do not run broad architecture sweeps, larger transformers, or new fold generation before testing the targeted readout fix."
